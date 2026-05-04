@@ -27,7 +27,25 @@ packages = ["renderers"]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    "ruff",
+    "ty>=0.0.1a29,<0.0.22",
 ]
 
 [tool.uv]
 exclude-newer = "7 days"
+
+[tool.ty.environment]
+python-version = "3.13"
+
+[tool.ty.rules]
+# Pre-existing diagnostics in v0.1.5 source — downgrade to advisory so CI
+# surfaces them without blocking. Tighten back to error as we clean up.
+unknown-argument = "warn"
+redundant-cast = "ignore"
+unresolved-import = "warn"
+invalid-argument-type = "warn"
+unresolved-attribute = "warn"
+invalid-key = "warn"
+unsupported-operator = "warn"
+invalid-return-type = "warn"
+invalid-assignment = "warn"
