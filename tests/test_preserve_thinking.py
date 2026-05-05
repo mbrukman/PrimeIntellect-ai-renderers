@@ -228,6 +228,125 @@ def test_preserve_btc_on_live_cycle_matches_all(model_name, tokenizer, renderer)
     )
 
 
+# ---------------------------------------------------------------------------
+# End-to-end visibility matrix
+# ---------------------------------------------------------------------------
+
+# Conversation shape: S-U-A-T-A-U-A-T-A. Each assistant carries a unique
+# sentinel string in ``reasoning_content`` so we can grep the decoded
+# output to see whose thinking was kept.
+TWO_BLOCK_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "lookup",
+            "description": "look up a value",
+            "parameters": {
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "required": ["key"],
+            },
+        },
+    }
+]
+
+TWO_BLOCK_CONV = [
+    {"role": "system", "content": "be brief"},
+    {"role": "user", "content": "first"},
+    {
+        "role": "assistant",
+        "reasoning_content": "REASON-A2",
+        "content": "calling.",
+        "tool_calls": [{"function": {"name": "lookup", "arguments": {"key": "a"}}}],
+    },
+    {"role": "tool", "name": "lookup", "content": "result-a"},
+    {"role": "assistant", "reasoning_content": "REASON-A4", "content": "answer-1"},
+    {"role": "user", "content": "second"},
+    {
+        "role": "assistant",
+        "reasoning_content": "REASON-A6",
+        "content": "calling.",
+        "tool_calls": [{"function": {"name": "lookup", "arguments": {"key": "b"}}}],
+    },
+    {"role": "tool", "name": "lookup", "content": "result-b"},
+    {"role": "assistant", "reasoning_content": "REASON-A8", "content": "answer-2"},
+]
+
+ALL_SENTINELS = ("REASON-A2", "REASON-A4", "REASON-A6", "REASON-A8")
+CURRENT_BLOCK_SENTINELS = ("REASON-A6", "REASON-A8")
+OLDER_BLOCK_SENTINELS = ("REASON-A2", "REASON-A4")
+
+# Renderers whose template renders ``reasoning_content`` for past-asst
+# under no condition. Flags accepted as no-ops; sentinels never appear.
+NEVER_PRESERVES_MODELS = {
+    "moonshotai/Kimi-K2-Instruct",
+    "Qwen/Qwen3-VL-4B-Instruct",
+    "Qwen/Qwen3-VL-8B-Instruct",
+    "Qwen/Qwen3-VL-30B-A3B-Instruct",
+}
+
+
+def test_preserve_all_thinking_emits_every_asst_reasoning(
+    model_name, tokenizer, renderer
+):
+    """``preserve_all_thinking=True`` must surface every past-asst's
+    ``reasoning_content`` in the decoded output — for renderers that
+    have any pathway to render reasoning at all."""
+    from renderers.default import DefaultRenderer
+
+    if isinstance(renderer, DefaultRenderer):
+        pytest.skip("DefaultRenderer raises on these flags — covered separately")
+
+    ids = renderer.render_ids(
+        TWO_BLOCK_CONV, tools=TWO_BLOCK_TOOLS, preserve_all_thinking=True
+    )
+    text = tokenizer.decode(ids)
+
+    if model_name in NEVER_PRESERVES_MODELS:
+        for sentinel in ALL_SENTINELS:
+            assert sentinel not in text, (
+                f"{model_name}: never-preserves renderer leaked {sentinel} "
+                f"under preserve_all_thinking"
+            )
+    else:
+        for sentinel in ALL_SENTINELS:
+            assert sentinel in text, (
+                f"{model_name}: preserve_all_thinking did not emit {sentinel} "
+                f"in decoded output"
+            )
+
+
+def test_preserve_btc_emits_current_block_reasoning(model_name, tokenizer, renderer):
+    """``preserve_thinking_between_tool_calls=True`` must surface the
+    current (post-last-user) tool block's reasoning. Older blocks fall
+    back to template default, which varies per renderer — no universal
+    assertion there."""
+    from renderers.default import DefaultRenderer
+
+    if isinstance(renderer, DefaultRenderer):
+        pytest.skip("DefaultRenderer raises on these flags — covered separately")
+
+    ids = renderer.render_ids(
+        TWO_BLOCK_CONV,
+        tools=TWO_BLOCK_TOOLS,
+        preserve_thinking_between_tool_calls=True,
+    )
+    text = tokenizer.decode(ids)
+
+    if model_name in NEVER_PRESERVES_MODELS:
+        for sentinel in ALL_SENTINELS:
+            assert sentinel not in text, (
+                f"{model_name}: never-preserves renderer leaked {sentinel} "
+                f"under preserve_thinking_between_tool_calls"
+            )
+    else:
+        for sentinel in CURRENT_BLOCK_SENTINELS:
+            assert sentinel in text, (
+                f"{model_name}: btc did not emit current-block {sentinel} "
+                f"in decoded output"
+            )
+
+
 def test_default_renderer_raises_on_flags():
     """``DefaultRenderer`` falls back to apply_chat_template with no
     selective re-emit pathway, so it must raise rather than silently ignore."""
