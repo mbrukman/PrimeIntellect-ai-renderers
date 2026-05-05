@@ -54,82 +54,84 @@ CONVERSATION = [
 
 
 def test_should_preserve_past_thinking_classification():
-    # CONVERSATION = [user, asst-with-tool_calls, tool, asst, user]
-    # User-bounded segment around asst[1] is (start, user[4]) which contains
-    # tool[2] — so asst[1] is in a tool-cycle segment.
+    # CURRENT-block-only behaviour. between_tool_calls preserves thinking
+    # ONLY for asst messages that sit AFTER the last user turn AND are in
+    # a segment that contains a tool. Anything before the last user turn
+    # falls back to template default (typically dropped).
+
+    # Live tool cycle: U-A_tc-T-A_final, no trailing user. The whole
+    # post-user segment contains a tool, so both A's are preserved.
+    live_cycle = [
+        {"role": "user", "content": "q"},
+        {
+            "role": "assistant",
+            "reasoning_content": "r1",
+            "tool_calls": [{"function": {"name": "f", "arguments": {}}}],
+        },
+        {"role": "tool", "name": "f", "content": "data"},
+        {"role": "assistant", "reasoning_content": "r2", "content": "answer"},
+    ]
     assert should_preserve_past_thinking(
-        CONVERSATION,
+        live_cycle,
         1,
         preserve_all_thinking=False,
         preserve_thinking_between_tool_calls=True,
     )
-    # Asst[3] sits in the same user-bounded segment as asst[1] (start..user[4])
-    # which contains tool[2] — so asst[3] is also in a tool-cycle segment.
-    # Catches the post-tool-result asst that the old "next msg is tool"
-    # heuristic would have missed.
     assert should_preserve_past_thinking(
-        CONVERSATION,
+        live_cycle,
         3,
         preserve_all_thinking=False,
         preserve_thinking_between_tool_calls=True,
     )
-    # preserve_all_thinking applies to every past-asst regardless.
+
+    # Same shape with a NEW user appended → now the prior tool block is
+    # "older" and between_tool_calls must drop its thinking (template
+    # default). Only preserve_all_thinking would keep them.
+    closed_cycle = live_cycle + [{"role": "user", "content": "next"}]
+    assert not should_preserve_past_thinking(
+        closed_cycle,
+        1,
+        preserve_all_thinking=False,
+        preserve_thinking_between_tool_calls=True,
+    )
+    assert not should_preserve_past_thinking(
+        closed_cycle,
+        3,
+        preserve_all_thinking=False,
+        preserve_thinking_between_tool_calls=True,
+    )
+    # preserve_all_thinking still keeps them.
     assert should_preserve_past_thinking(
-        CONVERSATION,
+        closed_cycle,
+        1,
+        preserve_all_thinking=True,
+        preserve_thinking_between_tool_calls=False,
+    )
+    assert should_preserve_past_thinking(
+        closed_cycle,
         3,
         preserve_all_thinking=True,
         preserve_thinking_between_tool_calls=False,
     )
+
+    # Current segment without a tool → not a tool cycle → not preserved.
+    no_tool_yet = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "reasoning_content": "r", "content": "a"},
+    ]
+    assert not should_preserve_past_thinking(
+        no_tool_yet,
+        1,
+        preserve_all_thinking=False,
+        preserve_thinking_between_tool_calls=True,
+    )
+
     # Both flags False → always False.
     assert not should_preserve_past_thinking(
-        CONVERSATION,
+        live_cycle,
         1,
         preserve_all_thinking=False,
         preserve_thinking_between_tool_calls=False,
-    )
-
-    # Mixed conversation where some U-segments have no tool: A in a
-    # tool-less segment must NOT be preserved by between_tool_calls.
-    no_tool_segment = [
-        {"role": "user", "content": "q1"},
-        {"role": "assistant", "reasoning_content": "r1", "content": "a1"},
-        {"role": "user", "content": "q2"},
-        {
-            "role": "assistant",
-            "reasoning_content": "r2",
-            "tool_calls": [{"function": {"name": "f", "arguments": {}}}],
-        },
-        {"role": "tool", "name": "f", "content": "data"},
-        {"role": "assistant", "reasoning_content": "r3", "content": "a3"},
-        {"role": "user", "content": "q3"},
-        {"role": "assistant", "reasoning_content": "r4", "content": "a4"},
-    ]
-    # asst[1]: segment (start, user[2]) — no tool → not preserved
-    assert not should_preserve_past_thinking(
-        no_tool_segment,
-        1,
-        preserve_all_thinking=False,
-        preserve_thinking_between_tool_calls=True,
-    )
-    # asst[3] and asst[5]: segment (user[2], user[6]) contains tool[4] → preserved
-    assert should_preserve_past_thinking(
-        no_tool_segment,
-        3,
-        preserve_all_thinking=False,
-        preserve_thinking_between_tool_calls=True,
-    )
-    assert should_preserve_past_thinking(
-        no_tool_segment,
-        5,
-        preserve_all_thinking=False,
-        preserve_thinking_between_tool_calls=True,
-    )
-    # asst[7]: segment (user[6], end) — no tool → not preserved
-    assert not should_preserve_past_thinking(
-        no_tool_segment,
-        7,
-        preserve_all_thinking=False,
-        preserve_thinking_between_tool_calls=True,
     )
 
 
@@ -183,6 +185,46 @@ def test_preserve_between_tool_calls_strict_subset(model_name, tokenizer, render
     assert len(default) <= len(between) <= len(all_), (
         f"{model_name}: expected default <= between <= all, "
         f"got {len(default)} <= {len(between)} <= {len(all_)}"
+    )
+
+
+LIVE_TOOL_CYCLE = [
+    {"role": "user", "content": "Weather in Paris?"},
+    {
+        "role": "assistant",
+        "reasoning_content": "Let me call the tool.",
+        "content": "Calling.",
+        "tool_calls": [
+            {"function": {"name": "get_weather", "arguments": {"city": "Paris"}}}
+        ],
+    },
+    {"role": "tool", "name": "get_weather", "content": "Sunny, 22C"},
+    {
+        "role": "assistant",
+        "reasoning_content": "Tool returned weather.",
+        "content": "Sunny.",
+    },
+]
+
+
+def test_preserve_btc_on_live_cycle_matches_all(model_name, tokenizer, renderer):
+    """In a live tool cycle (no trailing user), every past-asst sits in
+    the current tool-bearing segment. ``preserve_thinking_between_tool_calls``
+    should preserve all of their thinking — same set of asst messages as
+    ``preserve_all_thinking``, so the resulting token sequences must be
+    identical (independent of which template-default condition each
+    renderer uses internally)."""
+    from renderers.default import DefaultRenderer
+
+    if isinstance(renderer, DefaultRenderer):
+        pytest.skip("DefaultRenderer raises on these flags — covered separately")
+    btc = renderer.render_ids(
+        LIVE_TOOL_CYCLE, preserve_thinking_between_tool_calls=True
+    )
+    all_ = renderer.render_ids(LIVE_TOOL_CYCLE, preserve_all_thinking=True)
+    assert btc == all_, (
+        f"{model_name}: in a live tool cycle btc must match preserve_all "
+        f"(got len(btc)={len(btc)}, len(all)={len(all_)})"
     )
 
 

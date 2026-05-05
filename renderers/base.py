@@ -535,30 +535,33 @@ def should_preserve_past_thinking(
     Override rules:
 
     - ``preserve_all_thinking`` — every past-asst's thinking is kept.
-    - ``preserve_thinking_between_tool_calls`` — every assistant inside a
-      user-bounded segment that contains at least one ``tool`` message
-      is kept. That covers the whole asst→tool→asst→...→tool→asst loop:
-      the asst that issued the tool call AND the asst that responds to
-      the tool result both stay reasoning-tagged, since both are part of
-      the same in-flight tool cycle. Once a new ``user`` turn arrives,
-      the cycle closes and template default resumes.
+    - ``preserve_thinking_between_tool_calls`` — keeps thinking only
+      inside the *current* tool cycle: the contiguous A-T-...-A block
+      after the most recent ``user`` message, and only if that block
+      contains at least one ``tool`` response. As soon as a new
+      ``user`` turn arrives, the previous block becomes "older" and
+      its thinking is dropped (template default), matching how most
+      chat templates already handle multi-turn contexts. Use
+      ``preserve_all_thinking`` if you need thinking on older blocks
+      to survive the user-turn boundary too.
     """
     if preserve_all_thinking:
         return True
     if not preserve_thinking_between_tool_calls:
         return False
-    # User-bounded segment around msg_idx (exclusive bounds).
-    left = -1
-    for j in range(msg_idx - 1, -1, -1):
+    # Most recent user message (or -1 if none).
+    last_user = -1
+    for j in range(len(messages) - 1, -1, -1):
         if messages[j].get("role") == "user":
-            left = j
+            last_user = j
             break
-    right = len(messages)
-    for j in range(msg_idx + 1, len(messages)):
-        if messages[j].get("role") == "user":
-            right = j
-            break
-    return any(messages[j].get("role") == "tool" for j in range(left + 1, right))
+    if msg_idx <= last_user:
+        return False
+    # The current segment must contain a tool response for it to count
+    # as an in-flight tool cycle.
+    return any(
+        messages[j].get("role") == "tool" for j in range(last_user + 1, len(messages))
+    )
 
 
 def build_trajectory_step(
