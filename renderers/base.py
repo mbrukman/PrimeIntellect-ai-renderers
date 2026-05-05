@@ -535,21 +535,30 @@ def should_preserve_past_thinking(
     Override rules:
 
     - ``preserve_all_thinking`` — every past-asst's thinking is kept.
-    - ``preserve_thinking_between_tool_calls`` — past-asst with
-      ``tool_calls`` whose immediate next message is a ``tool`` response
-      is kept. Captures the in-flight asst→tool→asst→tool→... chain
-      where thinking is load-bearing for the next call.
+    - ``preserve_thinking_between_tool_calls`` — every assistant inside a
+      user-bounded segment that contains at least one ``tool`` message
+      is kept. That covers the whole asst→tool→asst→...→tool→asst loop:
+      the asst that issued the tool call AND the asst that responds to
+      the tool result both stay reasoning-tagged, since both are part of
+      the same in-flight tool cycle. Once a new ``user`` turn arrives,
+      the cycle closes and template default resumes.
     """
     if preserve_all_thinking:
         return True
     if not preserve_thinking_between_tool_calls:
         return False
-    msg = messages[msg_idx]
-    if not msg.get("tool_calls"):
-        return False
-    if msg_idx + 1 >= len(messages):
-        return False
-    return messages[msg_idx + 1].get("role") == "tool"
+    # User-bounded segment around msg_idx (exclusive bounds).
+    left = -1
+    for j in range(msg_idx - 1, -1, -1):
+        if messages[j].get("role") == "user":
+            left = j
+            break
+    right = len(messages)
+    for j in range(msg_idx + 1, len(messages)):
+        if messages[j].get("role") == "user":
+            right = j
+            break
+    return any(messages[j].get("role") == "tool" for j in range(left + 1, right))
 
 
 def build_trajectory_step(

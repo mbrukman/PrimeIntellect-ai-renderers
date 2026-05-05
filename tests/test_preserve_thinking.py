@@ -54,15 +54,20 @@ CONVERSATION = [
 
 
 def test_should_preserve_past_thinking_classification():
-    # Asst[1] has tool_calls and is followed by tool[2] — between-tool-calls.
+    # CONVERSATION = [user, asst-with-tool_calls, tool, asst, user]
+    # User-bounded segment around asst[1] is (start, user[4]) which contains
+    # tool[2] — so asst[1] is in a tool-cycle segment.
     assert should_preserve_past_thinking(
         CONVERSATION,
         1,
         preserve_all_thinking=False,
         preserve_thinking_between_tool_calls=True,
     )
-    # Asst[3] is followed by user[4] — not between tool calls.
-    assert not should_preserve_past_thinking(
+    # Asst[3] sits in the same user-bounded segment as asst[1] (start..user[4])
+    # which contains tool[2] — so asst[3] is also in a tool-cycle segment.
+    # Catches the post-tool-result asst that the old "next msg is tool"
+    # heuristic would have missed.
+    assert should_preserve_past_thinking(
         CONVERSATION,
         3,
         preserve_all_thinking=False,
@@ -81,6 +86,50 @@ def test_should_preserve_past_thinking_classification():
         1,
         preserve_all_thinking=False,
         preserve_thinking_between_tool_calls=False,
+    )
+
+    # Mixed conversation where some U-segments have no tool: A in a
+    # tool-less segment must NOT be preserved by between_tool_calls.
+    no_tool_segment = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "reasoning_content": "r1", "content": "a1"},
+        {"role": "user", "content": "q2"},
+        {
+            "role": "assistant",
+            "reasoning_content": "r2",
+            "tool_calls": [{"function": {"name": "f", "arguments": {}}}],
+        },
+        {"role": "tool", "name": "f", "content": "data"},
+        {"role": "assistant", "reasoning_content": "r3", "content": "a3"},
+        {"role": "user", "content": "q3"},
+        {"role": "assistant", "reasoning_content": "r4", "content": "a4"},
+    ]
+    # asst[1]: segment (start, user[2]) — no tool → not preserved
+    assert not should_preserve_past_thinking(
+        no_tool_segment,
+        1,
+        preserve_all_thinking=False,
+        preserve_thinking_between_tool_calls=True,
+    )
+    # asst[3] and asst[5]: segment (user[2], user[6]) contains tool[4] → preserved
+    assert should_preserve_past_thinking(
+        no_tool_segment,
+        3,
+        preserve_all_thinking=False,
+        preserve_thinking_between_tool_calls=True,
+    )
+    assert should_preserve_past_thinking(
+        no_tool_segment,
+        5,
+        preserve_all_thinking=False,
+        preserve_thinking_between_tool_calls=True,
+    )
+    # asst[7]: segment (user[6], end) — no tool → not preserved
+    assert not should_preserve_past_thinking(
+        no_tool_segment,
+        7,
+        preserve_all_thinking=False,
+        preserve_thinking_between_tool_calls=True,
     )
 
 
