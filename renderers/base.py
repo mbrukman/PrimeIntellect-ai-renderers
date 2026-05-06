@@ -139,8 +139,18 @@ class Renderer(Protocol):
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> RenderedTokens:
-        """Render messages to token IDs with per-token message attribution."""
+        """Render messages to token IDs with per-token message attribution.
+
+        ``preserve_all_thinking`` and ``preserve_thinking_between_tool_calls``
+        are *override* knobs — they only restore ``reasoning_content`` the
+        underlying chat template would drop, never strip thinking it emits.
+        Defaults are a no-op: rendered output stays byte-identical to the
+        original template behaviour. See ``should_preserve_past_thinking``
+        for the per-message classification.
+        """
         ...
 
     def render_ids(
@@ -149,6 +159,8 @@ class Renderer(Protocol):
         *,
         tools: list[ToolSpec] | None = None,
         add_generation_prompt: bool = False,
+        preserve_all_thinking: bool = False,
+        preserve_thinking_between_tool_calls: bool = False,
     ) -> list[int]:
         """Render messages to token IDs (without attribution metadata)."""
         ...
@@ -503,6 +515,53 @@ def reject_assistant_in_extension(new_messages: list[Message]) -> bool:
     the contract that sampled tokens land in training exactly as emitted.
     """
     return any(m.get("role") == "assistant" for m in new_messages)
+
+
+def should_preserve_past_thinking(
+    messages: list[Message],
+    msg_idx: int,
+    *,
+    preserve_all_thinking: bool,
+    preserve_thinking_between_tool_calls: bool,
+) -> bool:
+    """Should ``messages[msg_idx]``'s ``reasoning_content`` be emitted as
+    thinking even when the chat template would drop it?
+
+    Returns ``True`` only as an override above the template default. Each
+    renderer ORs this into its own "render thinking?" condition; a result
+    of ``False`` means "follow the template" (drop or keep as the template
+    decides), not "force-drop".
+
+    Override rules:
+
+    - ``preserve_all_thinking`` — every past-asst's thinking is kept.
+    - ``preserve_thinking_between_tool_calls`` — keeps thinking only
+      inside the *current* tool cycle: the contiguous A-T-...-A block
+      after the most recent ``user`` message, and only if that block
+      contains at least one ``tool`` response. As soon as a new
+      ``user`` turn arrives, the previous block becomes "older" and
+      its thinking is dropped (template default), matching how most
+      chat templates already handle multi-turn contexts. Use
+      ``preserve_all_thinking`` if you need thinking on older blocks
+      to survive the user-turn boundary too.
+    """
+    if preserve_all_thinking:
+        return True
+    if not preserve_thinking_between_tool_calls:
+        return False
+    # Most recent user message (or -1 if none).
+    last_user = -1
+    for j in range(len(messages) - 1, -1, -1):
+        if messages[j].get("role") == "user":
+            last_user = j
+            break
+    if msg_idx <= last_user:
+        return False
+    # The current segment must contain a tool response for it to count
+    # as an in-flight tool cycle.
+    return any(
+        messages[j].get("role") == "tool" for j in range(last_user + 1, len(messages))
+    )
 
 
 def build_trajectory_step(
