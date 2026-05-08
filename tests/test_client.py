@@ -54,14 +54,17 @@ class _FakeClient:
     URL off ``client.base_url``, so we expose one that includes the /v1 suffix
     the OpenAI SDK normally appends."""
 
-    def __init__(self):
+    def __init__(self, response=None):
         self.calls = []
         self.base_url = "http://fake-host:8000/v1"
+        self.response = response
 
     async def post(self, path, *, cast_to=dict, body=None, options=None):
         self.calls.append(
             {"path": path, "cast_to": cast_to, "body": body, "options": options}
         )
+        if self.response is not None:
+            return self.response
         routed_experts = np.array([[[1]], [[2]]], dtype=np.int32)
         return {
             "request_id": "gen-test",
@@ -291,3 +294,66 @@ def test_generate_serializes_multimodal_features_for_qwen3_vl():
     # Items are base64 strings (encode_mm_kwargs_item output).
     for item in features["kwargs_data"]["image"]:
         assert isinstance(item, str) and len(item) > 0
+
+
+def test_generate_can_use_dynamo_transport():
+    client = _FakeClient(
+        response={
+            "id": "chatcmpl-test",
+            "model": "test-model",
+            "nvext": {"completion_token_ids": [7, 8]},
+            "choices": [
+                {
+                    "logprobs": {
+                        "content": [
+                            {"token": "token_id:7", "logprob": -0.1},
+                            {"token": "token_id:8", "logprob": -0.2},
+                        ]
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+    )
+
+    result = asyncio.run(
+        generate(
+            client=client,
+            renderer=_FakeRenderer(),
+            messages=[{"role": "user", "content": "hi"}],
+            model="test-model",
+            tools=[{"type": "function", "function": {"name": "echo"}}],
+            sampling_params={
+                "temperature": 0.3,
+                "max_tokens": 7,
+                "min_tokens": 2,
+                "stop": "caller-stop",
+            },
+            priority=4,
+            cache_salt="ckpt-42",
+            transport="dynamo",
+        )
+    )
+
+    assert client.calls[0]["path"] == "/chat/completions"
+    assert client.calls[0]["body"] == {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "(token-in mode)"}],
+        "stream": False,
+        "logprobs": True,
+        "stop": [99],
+        "nvext": {
+            "token_data": [1, 2, 3],
+            "extra_fields": ["completion_token_ids"],
+            "agent_hints": {"priority": 4},
+        },
+        "cache_salt": "ckpt-42",
+        "max_completion_tokens": 7,
+        "temperature": 0.3,
+        "min_tokens": 2,
+    }
+    assert result["request_id"] == "chatcmpl-test"
+    assert result["prompt_ids"] == [1, 2, 3]
+    assert result["completion_ids"] == [7, 8]
+    assert result["completion_logprobs"] == [-0.1, -0.2]
+    assert result["finish_reason"] == "tool_calls"
