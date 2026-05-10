@@ -31,9 +31,14 @@ CUDA_VISIBLE_DEVICES=1 uv run --script examples/sglang/multiturn_generate_sglang
 The SGLang script uses `input_ids`, so SGLang does not apply a chat template.
 It leaves `openai-harmony` at SGLang's pinned version for dependency resolution.
 
-The script sets the SGLang Blackwell workaround needed for Qwen3.5
-(`attention_backend="triton"` and `SGLANG_DISABLE_CUDNN_CHECK=1`) inline so the
-recipe stays focused on the renderer flow.
+## Transformers Multi-Turn Recipe
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run --script examples/transformers/multiturn_generate_transformers.py
+```
+
+The Transformers script calls `generate()` with `input_ids`, so Transformers
+does not apply a chat template.
 
 ## Two-GPU Validation
 
@@ -49,7 +54,7 @@ CUDA_VISIBLE_DEVICES=1 uv run --script examples/sglang/multiturn_generate_sglang
 wait
 ```
 
-Both scripts run `Qwen/Qwen3.5-4B` with `enable_thinking=True` and `False`, then
+Each script runs `Qwen/Qwen3.5-4B` with `enable_thinking=True` and `False`, then
 `openai/gpt-oss-20b`.
 
 ## Multimodal Note

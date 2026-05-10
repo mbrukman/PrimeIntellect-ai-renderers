@@ -2,31 +2,35 @@
 # /// script
 # requires-python = ">=3.10,<3.14"
 # dependencies = [
-#   "sglang==0.5.10.post1",
-#   "flash-attn-4>=4.0.0b4",
-#   "transformers>=5.3.0",
-#   "openai-harmony==0.0.4",
+#   "transformers>=4.50.0",
+#   "accelerate",
+#   "torch",
+#   "kernels>=0.12.0",
+#   "openai-harmony>=0.0.8",
 #   "openai>=1.108.1",
 #   "tiktoken",
 #   "jinja2",
 #   "numpy",
 # ]
 # ///
-"""SGLang offline generation from renderer-owned prompt token IDs."""
+"""Transformers generation from renderer-owned prompt token IDs."""
 
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import sys
 from pathlib import Path
 
+import torch
+from transformers import AutoModelForCausalLM
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import sglang as sgl
 from renderers import create_renderer
 from renderers.base import load_tokenizer
 from renderers.qwen35 import Qwen35Renderer
@@ -57,9 +61,9 @@ TOOLS = [
 def make_renderer(model: str, enable_thinking: bool | None):
     tokenizer = load_tokenizer(model)
     if model.startswith("Qwen/Qwen3.5-"):
-        return Qwen35Renderer(tokenizer, enable_thinking=enable_thinking)
+        return Qwen35Renderer(tokenizer, enable_thinking=enable_thinking), tokenizer
     if model == "openai/gpt-oss-20b":
-        return create_renderer(tokenizer, renderer="gpt_oss")
+        return create_renderer(tokenizer, renderer="gpt_oss"), tokenizer
     raise ValueError(f"unsupported demo model: {model}")
 
 
@@ -73,18 +77,13 @@ def print_parsed(label: str, turn: str, parsed) -> None:
         print(f"content: {parsed.content}")
 
 
-def completion_ids(output: dict, prompt_ids: list[int]) -> list[int]:
-    ids = list(output.get("output_ids") or output.get("token_ids") or [])
-    if not ids:
-        raise RuntimeError("SGLang did not return completion token IDs")
-    return ids[len(prompt_ids) :] if ids[: len(prompt_ids)] == prompt_ids else ids
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--max-new-tokens", type=int, default=512)
-    parser.add_argument("--context-length", type=int, default=4096)
     args = parser.parse_args()
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("This example expects a CUDA GPU.")
 
     print(f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
 
@@ -104,25 +103,16 @@ def main() -> None:
         )
         print(f"\n=== {label} ===")
 
-        renderer = make_renderer(model, enable_thinking)
+        renderer, tokenizer = make_renderer(model, enable_thinking)
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model,
+            dtype=torch.bfloat16,
+            trust_remote_code=False,
+        ).to("cuda")
+        hf_model.eval()
 
-        engine_kwargs = {
-            "model_path": model,
-            "trust_remote_code": False,
-            "context_length": args.context_length,
-            "attention_backend": "triton",
-        }
-        if model == "openai/gpt-oss-20b":
-            engine_kwargs["moe_runner_backend"] = "triton"
-        engine = sgl.Engine(**engine_kwargs)
-
-        sampling = {
-            "temperature": 0.0,
-            "max_new_tokens": args.max_new_tokens,
-            "stop_token_ids": renderer.get_stop_token_ids(),
-            "skip_special_tokens": False,
-            "no_stop_trim": True,
-        }
+        stop_token_ids = renderer.get_stop_token_ids()
+        pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
         messages = [
             {"role": "system", "content": "You are a concise tool-using assistant."},
@@ -132,13 +122,22 @@ def main() -> None:
             },
         ]
 
-        # Turn 1: render locally and pass token IDs to SGLang. SGLang never
-        # sees messages and never applies a chat template.
+        # Turn 1: render locally and pass token IDs to Transformers. The model
+        # receives input_ids, not messages or a chat template.
         prompt_ids = renderer.render_ids(
             messages, tools=TOOLS, add_generation_prompt=True
         )
-        output1 = engine.generate(input_ids=prompt_ids, sampling_params=sampling)
-        completion1 = completion_ids(output1, prompt_ids)
+        input_ids = torch.tensor([prompt_ids], device="cuda")
+        attention_mask = torch.ones_like(input_ids)
+        output1 = hf_model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            do_sample=False,
+            max_new_tokens=args.max_new_tokens,
+            eos_token_id=stop_token_ids,
+            pad_token_id=pad_token_id,
+        )[0]
+        completion1 = output1[input_ids.shape[-1] :].tolist()
         parsed1 = renderer.parse_response(completion1)
         print_parsed(label, "turn 1", parsed1)
 
@@ -181,11 +180,22 @@ def main() -> None:
             prompt_ids + completion1
         )
 
-        output2 = engine.generate(input_ids=bridged_ids, sampling_params=sampling)
-        completion2 = completion_ids(output2, bridged_ids)
+        bridged_input_ids = torch.tensor([bridged_ids], device="cuda")
+        bridged_attention_mask = torch.ones_like(bridged_input_ids)
+        output2 = hf_model.generate(
+            input_ids=bridged_input_ids,
+            attention_mask=bridged_attention_mask,
+            do_sample=False,
+            max_new_tokens=args.max_new_tokens,
+            eos_token_id=stop_token_ids,
+            pad_token_id=pad_token_id,
+        )[0]
+        completion2 = output2[bridged_input_ids.shape[-1] :].tolist()
         print_parsed(label, "turn 2", renderer.parse_response(completion2))
 
-        engine.shutdown()
+        del hf_model
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

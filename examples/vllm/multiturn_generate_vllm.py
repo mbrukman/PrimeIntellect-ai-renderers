@@ -26,8 +26,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-
 from renderers import create_renderer
 from renderers.base import load_tokenizer
 from renderers.qwen35 import Qwen35Renderer
