@@ -28,7 +28,37 @@ class ThinkingPart(TypedDict):
     thinking: str
 
 
-ContentPart = TextPart | ThinkingPart
+class ImagePart(TypedDict, total=False):
+    """An image attached to a message.
+
+    Accepts several source shapes so callers can pass whatever they have
+    on hand — a pre-loaded PIL Image, a filesystem path, a URL, or the
+    OpenAI ``image_url`` content part verbatim. The renderer resolves
+    these to a PIL Image at render time.
+    """
+
+    type: Literal["image", "image_url"]
+    image: Any
+    url: str
+    path: str
+    image_url: dict[str, Any]
+
+
+class VideoPart(TypedDict, total=False):
+    """A video attached to a message.
+
+    Mirrors :class:`ImagePart`; the renderer turns frames into the
+    model's video placeholder sequence at render time.
+    """
+
+    type: Literal["video", "video_url"]
+    video: Any
+    url: str
+    path: str
+    video_url: dict[str, Any]
+
+
+ContentPart = TextPart | ThinkingPart | ImagePart | VideoPart
 
 # Content is either a plain string or a list of structured parts.
 Content = str | list[ContentPart]
@@ -78,16 +108,55 @@ class Message(TypedDict, total=False):
 
 
 @dataclass
+class PlaceholderRange:
+    """Where a single multimodal item's placeholder tokens sit in the stream.
+
+    ``offset`` is the 0-based index into ``RenderedTokens.token_ids`` of the
+    first placeholder token; ``length`` is the count of consecutive
+    placeholder tokens. Wraps the vLLM-style ``mm_placeholders`` shape
+    without depending on vLLM types.
+    """
+
+    offset: int
+    length: int
+
+
+@dataclass
+class MultiModalData:
+    """Multimodal sidecar produced alongside the token stream.
+
+    Renderer output is framework-agnostic: ``mm_items[modality][i]`` is a
+    plain ``dict`` mirroring the per-item output of a HuggingFace processor
+    (e.g. ``{"pixel_values": Tensor, "image_grid_thw": Tensor}`` for
+    Qwen3-VL images). Translation to engine-specific wire formats — vLLM's
+    ``MultiModalKwargsItem``, SGLang's payload, etc. — happens in the
+    inference glue layer (see ``renderers.client``).
+    """
+
+    mm_hashes: dict[str, list[str]] = field(default_factory=dict)
+    mm_placeholders: dict[str, list[PlaceholderRange]] = field(default_factory=dict)
+    mm_items: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+
+    def is_empty(self) -> bool:
+        return not (self.mm_hashes or self.mm_placeholders or self.mm_items)
+
+
+@dataclass
 class RenderedTokens:
     """Result of rendering messages to tokens.
 
     Each token carries an index into the original message list so callers can
     build per-token loss masks without re-rendering.  Tokens from structural
     scaffolding (generation prompt, im_start/im_end wrapping) carry index -1.
+
+    ``multi_modal_data`` is populated by multimodal renderers (e.g.
+    ``Qwen3VLRenderer``) when image / video content parts are present;
+    text-only renderers leave it as ``None``.
     """
 
     token_ids: list[int] = field(default_factory=list)
     message_indices: list[int] = field(default_factory=list)
+    multi_modal_data: "MultiModalData | None" = None
 
 
 @dataclass
@@ -180,16 +249,22 @@ class Renderer(Protocol):
         new_messages: list[Message],
         *,
         tools: list[ToolSpec] | None = None,
-    ) -> list[int] | None:
+    ) -> "list[int] | RenderedTokens | None":
         """Extend ``prev_prompt_ids + prev_completion_ids`` with the tokens
         the next turn adds, without re-rendering the sampled tokens.
 
-        Contract: if the return value ``B`` is not None, then
-        ``B[: len(prev_prompt) + len(prev_completion)] == prev_prompt + prev_completion``
+        Contract: if the return value's token sequence ``B`` is not None,
+        then ``B[: len(prev_prompt) + len(prev_completion)] == prev_prompt + prev_completion``
         and ``B`` ends at the position where the next assistant turn begins
         generating (i.e. equivalent to rendering the full message list so far
         with ``add_generation_prompt=True`` — except prev sampled tokens are
         kept verbatim rather than re-rendered).
+
+        Text-only renderers return ``list[int] | None``. Multimodal
+        renderers (e.g. ``Qwen3VLRenderer``) return ``RenderedTokens |
+        None`` so the caller can recover the placeholder offsets and
+        per-item processed tensors for the new full prompt — text-only
+        callers can normalize either via :func:`as_rendered_tokens`.
 
         Return ``None`` whenever the renderer can't prove that contract
         holds — the caller falls back to a full re-render. In particular,
@@ -309,6 +384,22 @@ MODEL_RENDERER_MAP: dict[str, str] = {
     # GPT-OSS.
     "openai/gpt-oss-20b": "gpt_oss",
     "openai/gpt-oss-120b": "gpt_oss",
+}
+
+
+# Per-model declaration of supported non-text modalities. Drives the
+# multimodal parity test matrix in ``tests/test_multimodal.py`` — each
+# ``(model, modality)`` pair gets a parity test against
+# ``processor.apply_chat_template`` + ``processor(...)``. Add a model
+# here when its renderer supports a new modality; the test matrix
+# picks it up automatically.
+#
+# Modality values: ``"image"``, ``"video"``, ``"audio"``. Text is implicit
+# (every model supports it), so it doesn't appear in the set.
+MULTIMODAL_MODELS: dict[str, set[str]] = {
+    "Qwen/Qwen3-VL-4B-Instruct": {"image"},
+    "Qwen/Qwen3-VL-8B-Instruct": {"image"},
+    "Qwen/Qwen3-VL-30B-A3B-Instruct": {"image"},
 }
 
 
@@ -599,6 +690,23 @@ def trim_to_turn_close(
     return previous_ids
 
 
+def as_rendered_tokens(
+    result: "list[int] | RenderedTokens | None",
+) -> "RenderedTokens | None":
+    """Normalize a ``bridge_to_next_turn`` result to ``RenderedTokens | None``.
+
+    Text-only renderers return raw ``list[int]``; multimodal renderers
+    return ``RenderedTokens`` (with ``multi_modal_data`` populated).
+    Callers that need the richer shape — to ship placeholder offsets and
+    processed tensors downstream — funnel both forms through this helper.
+    """
+    if result is None:
+        return None
+    if isinstance(result, RenderedTokens):
+        return result
+    return RenderedTokens(token_ids=list(result))
+
+
 def reject_assistant_in_extension(new_messages: list[Message]) -> bool:
     """Return True if any message in ``new_messages`` is an assistant turn.
 
@@ -668,17 +776,23 @@ def build_trajectory_step(
     Uses common_prefix_len to find the split point because generation prompts
     may diverge from the full sequence at token boundaries (e.g., ``\\n`` vs
     ``\\n\\n`` when thinking content is empty in Qwen3.5).
+
+    For multimodal renderers, attaches ``multi_modal_data`` keyed on the
+    full message sequence (assistant text doesn't carry placeholders, so
+    the full-render's mm sidecar covers every image up to and including
+    the completion).
     """
     has_completion = len(completion_messages) > 0
     prompt_ids = renderer.render_ids(
         prompt_messages, tools=tools, add_generation_prompt=has_completion
     )
-    full_ids = renderer.render_ids(prompt_messages + completion_messages, tools=tools)
+    full_rendered = renderer.render(prompt_messages + completion_messages, tools=tools)
+    full_ids = full_rendered.token_ids
 
     split_idx = _common_prefix_len(prompt_ids, full_ids)
     completion_ids = full_ids[split_idx:]
 
-    return {
+    out: dict[str, Any] = {
         "prompt_ids": full_ids[:split_idx],
         "prompt_mask": [False] * split_idx,
         "completion_ids": completion_ids,
@@ -686,3 +800,6 @@ def build_trajectory_step(
         "completion_logprobs": [0.0] * len(completion_ids),
         "routed_experts": None,
     }
+    if full_rendered.multi_modal_data is not None and not full_rendered.multi_modal_data.is_empty():
+        out["multi_modal_data"] = full_rendered.multi_modal_data
+    return out

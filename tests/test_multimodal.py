@@ -1,0 +1,386 @@
+"""Multimodal parity tests, parameterized by ``(model, modality)``.
+
+``MULTIMODAL_MODELS`` in ``renderers.base`` declares which checkpoints
+support which non-text modalities. This test matrix iterates over every
+``(model, modality)`` pair and asserts:
+
+1. **Token byte-parity** — ``Renderer.render_ids(...)`` matches
+   ``processor.apply_chat_template(..., tokenize=False)`` piped through
+   ``processor(images=..., text=..., return_tensors="pt")["input_ids"]``.
+2. **Placeholder anchoring** — ``RenderedTokens.multi_modal_data.mm_placeholders``
+   exactly cover the runs of the modality's placeholder token id
+   (``<|image_pad|>`` for images, ``<|video_pad|>`` for videos).
+3. **Bridge byte-parity** — ``bridge_to_next_turn`` with new multimodal
+   messages produces the same token sequence as a fresh full render of
+   the combined message list.
+
+Tests skip per-pair when:
+- The HF snapshot isn't cached locally (network-free CI mode).
+- The model lists a modality the renderer doesn't yet support
+  (``NotImplementedError`` in ``render``).
+- ``Pillow`` / ``torch`` are missing.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+
+from renderers import (
+    MULTIMODAL_MODELS,
+    Qwen3VLRenderer,
+    create_renderer,
+)
+from renderers.base import load_tokenizer
+
+
+pytest.importorskip("PIL", reason="Pillow required for multimodal tests")
+pytest.importorskip("torch", reason="torch required for multimodal tests")
+
+from PIL import Image  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Local-snapshot gating — skip when the HF cache doesn't have the model.
+# ---------------------------------------------------------------------------
+
+
+def _hf_snapshot_cached(model_name: str) -> bool:
+    """True iff the HF hub cache has at least one snapshot for ``model_name``.
+
+    Avoids pulling weights / configs over the network during test runs.
+    Mirrors the convention used elsewhere in this repo (test_qwen35_size_coverage)
+    of relying on the user having pre-fetched relevant models.
+    """
+    cache = Path(os.environ.get("HF_HOME") or Path.home() / ".cache" / "huggingface") / "hub"
+    safe = "models--" + model_name.replace("/", "--")
+    snapshots = cache / safe / "snapshots"
+    if not snapshots.is_dir():
+        return False
+    return any(p.is_dir() for p in snapshots.iterdir())
+
+
+# ---------------------------------------------------------------------------
+# Parametrization.
+# ---------------------------------------------------------------------------
+
+
+def _modality_cases():
+    """Flatten ``MULTIMODAL_MODELS`` into ``(model, modality)`` pairs."""
+    out: list[tuple[str, str]] = []
+    for model, modalities in MULTIMODAL_MODELS.items():
+        for modality in sorted(modalities):
+            out.append((model, modality))
+    return out
+
+
+_CASES = _modality_cases()
+
+
+# ---------------------------------------------------------------------------
+# Shared fixtures.
+# ---------------------------------------------------------------------------
+
+
+_loaded: dict[str, tuple] = {}
+
+
+def _load_processor_and_renderer(model_name: str):
+    if model_name not in _loaded:
+        from transformers import AutoProcessor
+
+        tokenizer = load_tokenizer(model_name)
+        processor = AutoProcessor.from_pretrained(model_name)
+        renderer = create_renderer(tokenizer, renderer="auto")
+        # Inject processor so the renderer doesn't try to fetch it lazily.
+        if hasattr(renderer, "_processor") and renderer._processor is None:
+            renderer._processor = processor
+        _loaded[model_name] = (tokenizer, processor, renderer)
+    return _loaded[model_name]
+
+
+@pytest.fixture(scope="module")
+def tiny_image():
+    """A small synthetic RGB image — keeps per-image-processor cost low."""
+    return Image.new("RGB", (224, 224), color=(128, 192, 255))
+
+
+# ---------------------------------------------------------------------------
+# Modality → (renderer-side content part, processor-side image-list builder).
+# Each modality has its own "make a content part" / "extract source images"
+# pair so the same parity machinery generalizes when video / audio land.
+# ---------------------------------------------------------------------------
+
+
+def _image_content_part(img):
+    return {"type": "image", "image": img}
+
+
+def _modality_kit(modality: str):
+    if modality == "image":
+        return {
+            "make_part": _image_content_part,
+            "placeholder_token": "<|image_pad|>",
+            "processor_kwarg": "images",
+        }
+    raise NotImplementedError(f"Test kit for modality {modality!r} not implemented yet.")
+
+
+# ---------------------------------------------------------------------------
+# Cases.
+# ---------------------------------------------------------------------------
+
+
+def _build_cases(make_part, image):
+    """Per-modality message scenarios. ``make_part`` builds a content part
+    for the modality under test; ``image`` is the shared sample item."""
+    return [
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What's in this image?"},
+                        make_part(image),
+                    ],
+                }
+            ],
+            True,
+            id="single_image_in_user",
+        ),
+        pytest.param(
+            [
+                {"role": "system", "content": "Be concise."},
+                {
+                    "role": "user",
+                    "content": [
+                        make_part(image),
+                        {"type": "text", "text": "Describe it."},
+                    ],
+                },
+            ],
+            True,
+            id="image_before_text_with_system",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Compare these:"},
+                        make_part(image),
+                        make_part(image),
+                    ],
+                }
+            ],
+            True,
+            id="two_images_one_turn",
+        ),
+        pytest.param(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        make_part(image),
+                        {"type": "text", "text": "First?"},
+                    ],
+                },
+                {"role": "assistant", "content": "It's a square."},
+                {
+                    "role": "user",
+                    "content": [
+                        make_part(image),
+                        {"type": "text", "text": "And now?"},
+                    ],
+                },
+            ],
+            True,
+            id="multi_turn_two_images",
+        ),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Tests.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mm_model_name,modality", _CASES, ids=[f"{m}|{mo}" for m, mo in _CASES])
+def test_multimodal_byte_parity_vs_processor(mm_model_name, modality, tiny_image):
+    """Token byte-parity with ``processor.apply_chat_template`` + ``processor(...)``.
+
+    Locks in the property that lets the inference engine see byte-identical
+    token ids regardless of whether the prompt is templated server-side
+    (MITO) or rendered client-side via this package.
+    """
+    if not _hf_snapshot_cached(mm_model_name):
+        pytest.skip(f"{mm_model_name}: HF snapshot not cached locally")
+
+    kit = _modality_kit(modality)
+    tokenizer, processor, renderer = _load_processor_and_renderer(mm_model_name)
+
+    for case in _build_cases(kit["make_part"], tiny_image):
+        messages, add_gp = case.values
+
+        # Ours.
+        ours = renderer.render_ids(messages, add_generation_prompt=add_gp)
+
+        # Theirs: apply_chat_template (string) → processor(text=, images=).
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=add_gp
+        )
+        images = []
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and (
+                        item.get("type") in ("image", "image_url")
+                        or "image" in item
+                        or "image_url" in item
+                    ):
+                        if "image" in item and not isinstance(item["image"], dict):
+                            images.append(item["image"])
+        theirs = processor(
+            **{kit["processor_kwarg"]: images},
+            text=text,
+            return_tensors="pt",
+        )["input_ids"][0].tolist()
+
+        assert ours == theirs, (
+            f"{mm_model_name} / {modality} / case={case.id}: "
+            f"renderer diverges from processor.\n"
+            f"  ours[:80]={ours[:80]}\n  theirs[:80]={theirs[:80]}\n"
+            f"  len(ours)={len(ours)} len(theirs)={len(theirs)}"
+        )
+
+
+@pytest.mark.parametrize("mm_model_name,modality", _CASES, ids=[f"{m}|{mo}" for m, mo in _CASES])
+def test_multimodal_placeholders_match_pad_runs(mm_model_name, modality, tiny_image):
+    """``mm_placeholders`` exactly cover the runs of the modality's pad token."""
+    if not _hf_snapshot_cached(mm_model_name):
+        pytest.skip(f"{mm_model_name}: HF snapshot not cached locally")
+
+    kit = _modality_kit(modality)
+    tokenizer, _, renderer = _load_processor_and_renderer(mm_model_name)
+    pad_id = tokenizer.convert_tokens_to_ids(kit["placeholder_token"])
+
+    for case in _build_cases(kit["make_part"], tiny_image):
+        messages, add_gp = case.values
+        rendered = renderer.render(messages, add_generation_prompt=add_gp)
+
+        assert rendered.multi_modal_data is not None, (
+            f"{mm_model_name} / {modality} / {case.id}: render() returned no mm_data"
+        )
+
+        # Discover the actual pad-token runs in the token stream.
+        pad_runs: list[tuple[int, int]] = []
+        i, n = 0, len(rendered.token_ids)
+        while i < n:
+            if rendered.token_ids[i] == pad_id:
+                start = i
+                while i < n and rendered.token_ids[i] == pad_id:
+                    i += 1
+                pad_runs.append((start, i - start))
+            else:
+                i += 1
+
+        claimed = [
+            (p.offset, p.length)
+            for p in rendered.multi_modal_data.mm_placeholders.get(modality, [])
+        ]
+        assert claimed == pad_runs, (
+            f"{mm_model_name} / {modality} / {case.id}: "
+            f"mm_placeholders {claimed} vs actual pad runs {pad_runs}"
+        )
+
+
+@pytest.mark.parametrize("mm_model_name,modality", _CASES, ids=[f"{m}|{mo}" for m, mo in _CASES])
+def test_multimodal_bridge_matches_full_render(mm_model_name, modality, tiny_image):
+    """``bridge_to_next_turn`` with a new multimodal user message produces
+    the same token sequence as fully re-rendering the combined history."""
+    if not _hf_snapshot_cached(mm_model_name):
+        pytest.skip(f"{mm_model_name}: HF snapshot not cached locally")
+
+    kit = _modality_kit(modality)
+    tokenizer, _, renderer = _load_processor_and_renderer(mm_model_name)
+
+    initial = [
+        {
+            "role": "user",
+            "content": [
+                kit["make_part"](tiny_image),
+                {"type": "text", "text": "Turn one."},
+            ],
+        }
+    ]
+    assistant = [{"role": "assistant", "content": "Saw it."}]
+    new = [
+        {
+            "role": "user",
+            "content": [
+                kit["make_part"](tiny_image),
+                {"type": "text", "text": "Turn two."},
+            ],
+        }
+    ]
+
+    initial_rendered = renderer.render(initial, add_generation_prompt=True)
+    # ``previous_completion_ids`` is what the sampler would emit starting
+    # AFTER the assistant role opener (which is part of the prompt via
+    # ``add_generation_prompt=True``) — i.e. the response text followed
+    # by ``<|im_end|>``.
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    completion_ids = tokenizer.encode("Saw it.", add_special_tokens=False) + [im_end_id]
+
+    bridged = renderer.bridge_to_next_turn(
+        previous_prompt_ids=initial_rendered.token_ids,
+        previous_completion_ids=completion_ids,
+        new_messages=new,
+        previous_multi_modal_data=initial_rendered.multi_modal_data,
+    )
+    assert bridged is not None, (
+        f"{mm_model_name} / {modality}: bridge returned None for multimodal extension"
+    )
+
+    full = renderer.render(initial + assistant + new, add_generation_prompt=True)
+    assert bridged.token_ids == full.token_ids, (
+        f"{mm_model_name} / {modality}: bridge token stream diverges from full render.\n"
+        f"  bridged[:80]={bridged.token_ids[:80]}\n  full[:80]={full.token_ids[:80]}"
+    )
+    # Bridge must carry forward both turns' images.
+    assert bridged.multi_modal_data is not None
+    assert len(bridged.multi_modal_data.mm_placeholders.get(modality, [])) == 2
+
+
+def test_modality_registry_models_route_to_renderer():
+    """Every model in ``MULTIMODAL_MODELS`` resolves to a concrete renderer
+    via ``create_renderer(renderer='auto')``. Guards against drift between
+    the multimodal registry and ``MODEL_RENDERER_MAP``."""
+    for model_name in MULTIMODAL_MODELS:
+        if not _hf_snapshot_cached(model_name):
+            continue
+        tokenizer = load_tokenizer(model_name)
+        renderer = create_renderer(tokenizer, renderer="auto")
+        # We expect a hand-coded VL renderer, not the default fallback.
+        assert not type(renderer).__name__.startswith("Default"), (
+            f"{model_name} routed to DefaultRenderer despite being in "
+            f"MULTIMODAL_MODELS — add it to MODEL_RENDERER_MAP."
+        )
+
+
+def test_qwen3_vl_renderer_exposes_image_modality():
+    """The flagship multimodal renderer is concretely Qwen3VLRenderer.
+
+    Sanity-check that the dispatch wiring works end-to-end: model in
+    registry → load → create_renderer(auto) → expected concrete class.
+    """
+    model = "Qwen/Qwen3-VL-4B-Instruct"
+    if not _hf_snapshot_cached(model):
+        pytest.skip(f"{model}: HF snapshot not cached locally")
+    tokenizer = load_tokenizer(model)
+    renderer = create_renderer(tokenizer, renderer="auto")
+    assert isinstance(renderer, Qwen3VLRenderer)
+    assert "image" in MULTIMODAL_MODELS[model]
