@@ -1,12 +1,10 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.10,<3.14"
+# requires-python = ">=3.11,<3.14"
 # dependencies = [
 #   "renderers>=0.1.6",
-#   "transformers>=4.50.0",
-#   "accelerate",
-#   "torch",
-#   "kernels>=0.12.0",
+#   "tinker>=0.9.0",
+#   "transformers>=4.57.6,<=5.5.3",
 #   "openai-harmony>=0.0.8",
 #   "openai>=1.108.1",
 #   "tiktoken",
@@ -14,20 +12,20 @@
 #   "numpy",
 # ]
 # ///
-"""Transformers generation from renderer-owned prompt token IDs."""
+"""Tinker remote sampling from renderer-owned prompt token IDs."""
 
 from __future__ import annotations
 
 import argparse
-import gc
+import asyncio
 import json
 import os
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
+import tinker
 from renderers.gpt_oss import GptOssRenderer
 from renderers.qwen35 import Qwen35Renderer
+from tinker import types
+from transformers import AutoTokenizer
 
 
 MODELS = ["Qwen/Qwen3.5-4B", "openai/gpt-oss-20b"]
@@ -55,9 +53,9 @@ TOOLS = [
 def make_renderer(model: str, enable_thinking: bool | None):
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=False)
     if model.startswith("Qwen/Qwen3.5-"):
-        return Qwen35Renderer(tokenizer, enable_thinking=enable_thinking), tokenizer
+        return Qwen35Renderer(tokenizer, enable_thinking=enable_thinking)
     if model == "openai/gpt-oss-20b":
-        return GptOssRenderer(tokenizer), tokenizer
+        return GptOssRenderer(tokenizer)
     raise ValueError(f"unsupported demo model: {model}")
 
 
@@ -71,16 +69,16 @@ def print_parsed(label: str, turn: str, parsed) -> None:
         print(f"content: {parsed.content}")
 
 
-def main() -> None:
+async def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--max-tokens", type=int, default=512)
+    parser.add_argument("--base-url", default=None)
     args = parser.parse_args()
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("This example expects a CUDA GPU.")
+    if "TINKER_API_KEY" not in os.environ:
+        raise RuntimeError("Set TINKER_API_KEY before running this example.")
 
-    print(f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
-
+    service_client = tinker.ServiceClient(base_url=args.base_url)
     targets = []
     for model in MODELS:
         if model.startswith("Qwen/Qwen3.5-"):
@@ -97,16 +95,15 @@ def main() -> None:
         )
         print(f"\n=== {label} ===")
 
-        renderer, tokenizer = make_renderer(model, enable_thinking)
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            model,
-            dtype=torch.bfloat16,
-            trust_remote_code=False,
-        ).to("cuda")
-        hf_model.eval()
-
-        stop_token_ids = renderer.get_stop_token_ids()
-        pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+        renderer = make_renderer(model, enable_thinking)
+        sampling_client = await service_client.create_sampling_client_async(
+            base_model=model
+        )
+        sampling_params = types.SamplingParams(
+            max_tokens=args.max_tokens,
+            temperature=0.0,
+            stop=renderer.get_stop_token_ids(),
+        )
 
         messages = [
             {"role": "system", "content": "You are a concise tool-using assistant."},
@@ -116,22 +113,17 @@ def main() -> None:
             },
         ]
 
-        # Turn 1: render locally and pass token IDs to Transformers. The model
-        # receives input_ids, not messages or a chat template.
+        # Turn 1: render locally and pass token IDs to Tinker. Tinker receives
+        # a ModelInput, not messages or a chat template.
         prompt_ids = renderer.render_ids(
             messages, tools=TOOLS, add_generation_prompt=True
         )
-        input_ids = torch.tensor([prompt_ids], device="cuda")
-        attention_mask = torch.ones_like(input_ids)
-        output1 = hf_model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            do_sample=False,
-            max_new_tokens=args.max_new_tokens,
-            eos_token_id=stop_token_ids,
-            pad_token_id=pad_token_id,
-        )[0]
-        completion1 = output1[input_ids.shape[-1] :].tolist()
+        output1 = await sampling_client.sample_async(
+            prompt=types.ModelInput.from_ints(prompt_ids),
+            num_samples=1,
+            sampling_params=sampling_params,
+        )
+        completion1 = list(output1.sequences[0].tokens)
         parsed1 = renderer.parse_response(completion1)
         print_parsed(label, "turn 1", parsed1)
 
@@ -174,23 +166,14 @@ def main() -> None:
             prompt_ids + completion1
         )
 
-        bridged_input_ids = torch.tensor([bridged_ids], device="cuda")
-        bridged_attention_mask = torch.ones_like(bridged_input_ids)
-        output2 = hf_model.generate(
-            input_ids=bridged_input_ids,
-            attention_mask=bridged_attention_mask,
-            do_sample=False,
-            max_new_tokens=args.max_new_tokens,
-            eos_token_id=stop_token_ids,
-            pad_token_id=pad_token_id,
-        )[0]
-        completion2 = output2[bridged_input_ids.shape[-1] :].tolist()
+        output2 = await sampling_client.sample_async(
+            prompt=types.ModelInput.from_ints(bridged_ids),
+            num_samples=1,
+            sampling_params=sampling_params,
+        )
+        completion2 = list(output2.sequences[0].tokens)
         print_parsed(label, "turn 2", renderer.parse_response(completion2))
-
-        del hf_model
-        gc.collect()
-        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

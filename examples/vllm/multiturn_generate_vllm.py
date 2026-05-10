@@ -2,6 +2,7 @@
 # /// script
 # requires-python = ">=3.10,<3.14"
 # dependencies = [
+#   "renderers>=0.1.6",
 #   "vllm>=0.20",
 #   "transformers>=4.50.0",
 #   "openai-harmony>=0.0.8",
@@ -19,16 +20,10 @@ import argparse
 import gc
 import json
 import os
-import sys
-from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from renderers import create_renderer
-from renderers.base import load_tokenizer
+from renderers.gpt_oss import GptOssRenderer
 from renderers.qwen35 import Qwen35Renderer
+from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
 
@@ -55,11 +50,11 @@ TOOLS = [
 
 
 def make_renderer(model: str, enable_thinking: bool | None):
-    tokenizer = load_tokenizer(model)
+    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=False)
     if model.startswith("Qwen/Qwen3.5-"):
         return Qwen35Renderer(tokenizer, enable_thinking=enable_thinking)
     if model == "openai/gpt-oss-20b":
-        return create_renderer(tokenizer, renderer="gpt_oss")
+        return GptOssRenderer(tokenizer)
     raise ValueError(f"unsupported demo model: {model}")
 
 

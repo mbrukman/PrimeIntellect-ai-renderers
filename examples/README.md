@@ -40,6 +40,15 @@ CUDA_VISIBLE_DEVICES=0 uv run --script examples/transformers/multiturn_generate_
 The Transformers script calls `generate()` with `input_ids`, so Transformers
 does not apply a chat template.
 
+## Tinker Multi-Turn Recipe
+
+```bash
+TINKER_API_KEY=... uv run --script examples/tinker/multiturn_generate_tinker.py
+```
+
+The Tinker script sends renderer-produced token IDs as `ModelInput` to the
+remote sampling API, so Tinker does not apply a chat template.
+
 ## Two-GPU Validation
 
 Run the recipes in parallel, one backend per GPU:
