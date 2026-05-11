@@ -413,6 +413,15 @@ MULTIMODAL_MODELS: dict[str, set[str]] = {
     # Qwen3.6 extends Qwen3.5's chat template; same VL bits, only
     # tool-call argument serialization differs.
     "Qwen/Qwen3.6-35B-A3B": {"image"},
+    # Kimi K2.5 / K2.6 are unified VLMs (HF tag ``image-text-to-text``)
+    # with custom processor (``KimiK25Processor`` + ``KimiK25VisionProcessor``).
+    # Vision wrap is different from Qwen-VL:
+    # ``<|media_begin|>image<|media_content|><|media_pad|><|media_end|>`` —
+    # only ONE ``<|media_pad|>`` per image in ``input_ids``; per-patch
+    # expansion happens internally in the model from ``pixel_values`` /
+    # ``grid_thws``.
+    "moonshotai/Kimi-K2.5": {"image"},
+    "moonshotai/Kimi-K2.6": {"image"},
 }
 
 

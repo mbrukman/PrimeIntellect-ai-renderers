@@ -102,7 +102,11 @@ def _load_pil_image(item: dict[str, Any]):
     if "image" in item:
         raw = item["image"]
     elif "image_url" in item:
-        raw = (item.get("image_url") or {}).get("url")
+        # OpenAI canonical shape is ``image_url: {"url": "..."}`` — but
+        # some VLM processors (Kimi K2.5 / K2.6) hand a raw PIL / str
+        # directly under ``image_url``. Accept both.
+        iu = item.get("image_url")
+        raw = iu.get("url") if isinstance(iu, dict) else iu
     else:
         raw = item.get("url") or item.get("path")
 

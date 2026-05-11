@@ -368,15 +368,23 @@ def test_multimodal_placeholders_match_pad_runs(mm_model_name, modality, tiny_im
 
 def _gen_prompt_injects_tokens_after_role(renderer) -> bool:
     """True if the renderer's generation prompt injects tokens between
-    ``<|im_start|>assistant\\n`` and the position where the sampler starts
-    emitting (e.g. Qwen3.5's ``<think>\\n`` opener). For such renderers,
-    bridge_to_next_turn preserves the past gen-prompt tokens verbatim,
-    while a full re-render of the same multi-turn conversation does NOT
-    re-emit them for past assistants (matching HF chat-template semantics
-    — verified against ``tokenizer.apply_chat_template``). The two paths
-    intentionally diverge.
+    the assistant-role tokens and the position where the sampler starts
+    emitting (e.g. Qwen3.5's ``<think>\\n`` opener, Kimi K2.5's
+    ``<think>`` prefill). For such renderers, ``bridge_to_next_turn``
+    preserves the past gen-prompt tokens verbatim, while a full re-render
+    of the same multi-turn conversation does NOT re-emit them for past
+    assistants (matching HF chat-template semantics — verified against
+    ``tokenizer.apply_chat_template``). The two paths intentionally
+    diverge.
     """
-    return hasattr(renderer, "_think") and hasattr(renderer, "_enable_thinking")
+    # Qwen3.5 / Qwen3.6: integer ``<think>`` special-token id on ``_think``.
+    if hasattr(renderer, "_think") and hasattr(renderer, "_enable_thinking"):
+        return True
+    # Kimi K2.5 / K2.6: ``<think>`` is multi-token text, encoded into
+    # ``_think_open_ids`` plus the same ``_enable_thinking`` flag.
+    if hasattr(renderer, "_think_open_ids") and hasattr(renderer, "_enable_thinking"):
+        return True
+    return False
 
 
 @pytest.mark.parametrize("mm_model_name,modality", _CASES, ids=[f"{m}|{mo}" for m, mo in _CASES])
