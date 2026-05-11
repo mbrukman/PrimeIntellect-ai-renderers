@@ -254,12 +254,36 @@ class Qwen3VLRenderer:
         self._image_pad = self._token_id("<|image_pad|>")
         self._video_pad = self._token_id("<|video_pad|>")
 
+        # Per-instance image-processor cache. The HF image processor is the
+        # most expensive step on the renderer hot path (~tens of ms per
+        # image for typical grid_thw). The same image gets re-seen across
+        # ``rollouts_per_example`` rollouts of one example and (for
+        # multi-turn) across turn boundaries when the bridge re-renders
+        # rather than extends. Cache keyed by content hash — values are
+        # tuples of ``(processor_out, num_image_tokens)`` — bounded to
+        # avoid unbounded growth on long-lived pools.
+        self._image_cache: dict[str, tuple[Any, int]] = {}
+        self._image_cache_max = 256
+
     def _token_id(self, token: str) -> int:
         tid = self._tokenizer.convert_tokens_to_ids(token)
         assert isinstance(tid, int) and tid != self._tokenizer.unk_token_id, (
             f"Special token {token!r} not found in tokenizer vocabulary"
         )
         return tid
+
+    @property
+    def mm_token_type_id_map(self) -> dict[int, int]:
+        """Token-id → modality marker used to build ``mm_token_type_ids``.
+
+        Qwen3-VL uses a single placeholder token per image/video patch
+        (``<|image_pad|>``, ``<|video_pad|>``); the trainer's forward
+        expects a per-token int tensor where 1 = image patch, 2 = video
+        patch, 0 = anything else. The orchestrator walks the final token
+        sequence and applies this map (constant per renderer instance,
+        cached at construction) — no separate processor load needed.
+        """
+        return {self._image_pad: 1, self._video_pad: 2}
 
     def _encode(self, text: str) -> list[int]:
         if not text:
@@ -314,14 +338,26 @@ class Qwen3VLRenderer:
         """Resolve, process, and characterize a single image part.
 
         Returns ``(pil, processor_out, num_image_tokens, image_hash)``.
+        Hashes the loaded PIL first and consults ``self._image_cache``;
+        on hit the HF image-processor call is skipped entirely.
         """
         pil = _load_pil_image(part)
+        h = _image_hash(pil)
+        cached = self._image_cache.get(h)
+        if cached is not None:
+            out, num_image_tokens = cached
+            return pil, out, num_image_tokens, h
         proc = self._get_processor()
         out = proc.image_processor(images=[pil], return_tensors="pt")
         grid_thw = out["image_grid_thw"][0]
         merge_size = proc.image_processor.merge_size
         num_image_tokens = int(grid_thw.prod()) // (merge_size * merge_size)
-        return pil, out, num_image_tokens, _image_hash(pil)
+        if len(self._image_cache) >= self._image_cache_max:
+            # FIFO eviction — Python dicts preserve insertion order, so
+            # ``next(iter(...))`` is the oldest key.
+            self._image_cache.pop(next(iter(self._image_cache)))
+        self._image_cache[h] = (out, num_image_tokens)
+        return pil, out, num_image_tokens, h
 
     def render(
         self,

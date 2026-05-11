@@ -403,6 +403,37 @@ MULTIMODAL_MODELS: dict[str, set[str]] = {
 }
 
 
+def _model_has_vision_config(model_name: str) -> bool:
+    """Return True if the HF config for ``model_name`` declares vision inputs.
+
+    Used by ``create_renderer`` to fail loudly on VLMs that miss the
+    ``MODEL_RENDERER_MAP`` exact-match lookup. DefaultRenderer silently
+    drops images (it only knows ``apply_chat_template`` + text tokens),
+    so a VLM falling back to it would produce token streams that don't
+    match what the trainer reconstructs — a class of bug the renderer
+    abstraction exists to prevent.
+
+    Returns False on any AutoConfig failure (offline, gated, missing) so
+    a flaky HF probe never blocks a legitimate text-only fine-tune.
+    """
+    try:
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=False)
+    except Exception:
+        return False
+    # Most VLM configs nest a vision tower as ``vision_config`` (Qwen-VL,
+    # Llava, Gemma3, Idefics, MiniCPM-V, ...). A few use ``vision_tower``
+    # or expose a top-level ``image_token_id``; check those too.
+    if getattr(cfg, "vision_config", None) is not None:
+        return True
+    if getattr(cfg, "vision_tower", None) is not None:
+        return True
+    if getattr(cfg, "image_token_id", None) is not None:
+        return True
+    return False
+
+
 # Models whose tokenizer requires ``trust_remote_code=True`` AND a pinned
 # revision. Empirical audit (2026-05-07) confirms only the Moonshot
 # Kimi-K2 family ships an ``auto_map.AutoTokenizer`` entry that runs
@@ -608,7 +639,23 @@ def create_renderer(
     if renderer_name is not None:
         return RENDERER_REGISTRY[renderer_name](tokenizer, **preserve_kwargs)
 
-    # No match — fall back to default (apply_chat_template). For fine-tunes
+    # No match. For VLMs this must be fatal: DefaultRenderer only knows
+    # ``apply_chat_template`` + text tokens, so it would silently drop
+    # images and produce a token stream the trainer can't reconstruct.
+    # Catch this at the renderer-selection seam — well before any
+    # rollout — so the failure mode is "config error at startup," not
+    # "mysterious KL divergence after 100 steps."
+    if model_name in MULTIMODAL_MODELS or _model_has_vision_config(model_name):
+        supported_vlms = sorted(MULTIMODAL_MODELS)
+        raise ValueError(
+            f"No multimodal renderer registered for {model_name!r}, and "
+            f"DefaultRenderer would silently drop images. Register a "
+            f"renderer in MODEL_RENDERER_MAP (currently supported VLMs: "
+            f"{supported_vlms}), or pass ``renderer='<name>'`` explicitly "
+            f"if you know what you're doing."
+        )
+
+    # Text-only fall back to default (apply_chat_template). For fine-tunes
     # with customized chat templates this is the *correct* choice, so we don't
     # warn. Note the pick at INFO and advertise the parser knobs.
     logger.info(
