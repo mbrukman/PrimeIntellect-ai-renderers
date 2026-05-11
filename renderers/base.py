@@ -249,22 +249,25 @@ class Renderer(Protocol):
         new_messages: list[Message],
         *,
         tools: list[ToolSpec] | None = None,
-    ) -> "list[int] | RenderedTokens | None":
+    ) -> "RenderedTokens | None":
         """Extend ``prev_prompt_ids + prev_completion_ids`` with the tokens
         the next turn adds, without re-rendering the sampled tokens.
 
-        Contract: if the return value's token sequence ``B`` is not None,
-        then ``B[: len(prev_prompt) + len(prev_completion)] == prev_prompt + prev_completion``
-        and ``B`` ends at the position where the next assistant turn begins
-        generating (i.e. equivalent to rendering the full message list so far
-        with ``add_generation_prompt=True`` — except prev sampled tokens are
-        kept verbatim rather than re-rendered).
+        Contract: if the return value's ``token_ids`` sequence ``B`` is
+        not None, then
+        ``B[: len(prev_prompt) + len(prev_completion)] == prev_prompt + prev_completion``
+        and ``B`` ends at the position where the next assistant turn
+        begins generating (i.e. equivalent to rendering the full message
+        list so far with ``add_generation_prompt=True`` — except prev
+        sampled tokens are kept verbatim rather than re-rendered).
 
-        Text-only renderers return ``list[int] | None``. Multimodal
-        renderers (e.g. ``Qwen3VLRenderer``) return ``RenderedTokens |
-        None`` so the caller can recover the placeholder offsets and
-        per-item processed tensors for the new full prompt — text-only
-        callers can normalize either via :func:`as_rendered_tokens`.
+        Text-only renderers return :class:`RenderedTokens` with
+        ``multi_modal_data=None``. Multimodal renderers (see
+        :class:`MultimodalRenderer`) populate ``multi_modal_data`` so
+        the caller can recover placeholder offsets + per-item processed
+        tensors for the new full prompt; they also accept a
+        ``previous_multi_modal_data`` kwarg via the
+        :class:`MultimodalRenderer` Protocol override.
 
         Return ``None`` whenever the renderer can't prove that contract
         holds — the caller falls back to a full re-render. In particular,
@@ -273,6 +276,53 @@ class Renderer(Protocol):
         canonical close and synthesise it on truncated priors;
         DefaultRenderer always returns ``None`` because the template's
         close is unknown.
+        """
+        ...
+
+
+@runtime_checkable
+class MultimodalRenderer(Renderer, Protocol):
+    """A :class:`Renderer` that supports multimodal inputs (images, video).
+
+    Concrete classes (``Qwen3VLRenderer``, ``Qwen35Renderer``,
+    ``Qwen36Renderer``, ``KimiK25Renderer``) implement this Protocol
+    structurally — no explicit inheritance required. Callers that need
+    to drive vLLM's ``multi_modal_data`` features field or carry images
+    forward across turns should dispatch on ``isinstance(r,
+    MultimodalRenderer)`` and use the extended ``bridge_to_next_turn``
+    signature below.
+    """
+
+    @property
+    def mm_token_type_id_map(self) -> dict[int, int]:
+        """Map from special-token IDs to per-token modality markers.
+
+        Convention: ``1`` = image placeholder (e.g. ``<|image_pad|>``),
+        ``2`` = video placeholder (e.g. ``<|video_pad|>``). The
+        orchestrator stamps these onto each rendered token to drive
+        the trainer's vision-encoder slicing logic.
+        """
+        ...
+
+    def bridge_to_next_turn(
+        self,
+        previous_prompt_ids: list[int],
+        previous_completion_ids: list[int],
+        new_messages: list[Message],
+        *,
+        tools: list[ToolSpec] | None = None,
+        previous_multi_modal_data: "MultiModalData | None" = None,
+    ) -> "RenderedTokens | None":
+        """Same contract as :meth:`Renderer.bridge_to_next_turn`, plus:
+
+        - accepts ``previous_multi_modal_data`` so prior-turn images
+          carry forward into the new prompt's ``mm_placeholders``;
+          without this, vLLM sees placeholder counts that don't match
+          the combined token sequence and silently falls back to
+          hash-cache lookup (or errors)
+        - returns :class:`RenderedTokens` (not ``list[int]``) so the
+          caller can recover the placeholder offsets + per-item
+          processed tensors for the new full prompt
         """
         ...
 
@@ -757,23 +807,6 @@ def trim_to_turn_close(
         return None
     previous_ids.append(synthesize_close)
     return previous_ids
-
-
-def as_rendered_tokens(
-    result: "list[int] | RenderedTokens | None",
-) -> "RenderedTokens | None":
-    """Normalize a ``bridge_to_next_turn`` result to ``RenderedTokens | None``.
-
-    Text-only renderers return raw ``list[int]``; multimodal renderers
-    return ``RenderedTokens`` (with ``multi_modal_data`` populated).
-    Callers that need the richer shape — to ship placeholder offsets and
-    processed tensors downstream — funnel both forms through this helper.
-    """
-    if result is None:
-        return None
-    if isinstance(result, RenderedTokens):
-        return result
-    return RenderedTokens(token_ids=list(result))
 
 
 def reject_assistant_in_extension(new_messages: list[Message]) -> bool:

@@ -504,7 +504,7 @@ class Qwen35Renderer:
         *,
         tools: list[ToolSpec] | None = None,
         previous_multi_modal_data: MultiModalData | None = None,
-    ) -> "list[int] | RenderedTokens | None":
+    ) -> "RenderedTokens | None":
         if (
             not previous_prompt_ids
             or not new_messages
@@ -650,12 +650,8 @@ class Qwen35Renderer:
         for modality, vals in new_items.items():
             merged_items.setdefault(modality, []).extend(vals)
 
-        # Text-only callers (and existing tests) expect a ``list[int]``
-        # return; only switch to ``RenderedTokens`` when media is present
-        # so callers can recover ``multi_modal_data``. The verifiers
-        # client normalizes both shapes via ``as_rendered_tokens(...)``.
         if not (merged_hashes or merged_placeholders or merged_items):
-            return tokens
+            return RenderedTokens(token_ids=tokens)
 
         mm_data = MultiModalData(
             mm_hashes=merged_hashes,
