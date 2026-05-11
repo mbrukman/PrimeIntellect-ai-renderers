@@ -191,6 +191,17 @@ def _build_mm_features(
     fields belong to each modality, how they batch — and is currently
     model-family specific. For now we dispatch on the renderer class;
     extend the dispatch table as more multimodal renderers land.
+
+    NOTE — future engine pluggability: this encoder is vLLM 0.20-specific
+    (uses ``vllm.multimodal.inputs.MultiModalKwargsItems``,
+    ``vllm.entrypoints.serve.disagg.mm_serde.encode_mm_kwargs_item``, and
+    ``_create_qwen2vl_field_factory``). When a second inference engine
+    arrives (SGLang, MAX, ...) the renderer client should be parameterized
+    on engine: either (a) move the encoder onto the renderer as
+    ``encode_mm_for_<engine>(mm_data)`` methods, or (b) accept an
+    ``Encoder`` strategy at the ``generate(...)`` call site. The data type
+    (``MultiModalData``) is already framework-agnostic and does not need
+    to change. Don't pre-build the abstraction with one engine in tree.
     """
     from renderers.qwen3_vl import Qwen3VLRenderer
 

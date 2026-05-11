@@ -297,6 +297,19 @@ def test_multimodal_placeholders_match_pad_runs(mm_model_name, modality, tiny_im
         )
 
 
+def _gen_prompt_injects_tokens_after_role(renderer) -> bool:
+    """True if the renderer's generation prompt injects tokens between
+    ``<|im_start|>assistant\\n`` and the position where the sampler starts
+    emitting (e.g. Qwen3.5's ``<think>\\n`` opener). For such renderers,
+    bridge_to_next_turn preserves the past gen-prompt tokens verbatim,
+    while a full re-render of the same multi-turn conversation does NOT
+    re-emit them for past assistants (matching HF chat-template semantics
+    — verified against ``tokenizer.apply_chat_template``). The two paths
+    intentionally diverge.
+    """
+    return hasattr(renderer, "_think") and hasattr(renderer, "_enable_thinking")
+
+
 @pytest.mark.parametrize("mm_model_name,modality", _CASES, ids=[f"{m}|{mo}" for m, mo in _CASES])
 def test_multimodal_bridge_matches_full_render(mm_model_name, modality, tiny_image):
     """``bridge_to_next_turn`` with a new multimodal user message produces
@@ -306,6 +319,15 @@ def test_multimodal_bridge_matches_full_render(mm_model_name, modality, tiny_ima
 
     kit = _modality_kit(modality)
     tokenizer, _, renderer = _load_processor_and_renderer(mm_model_name)
+
+    if _gen_prompt_injects_tokens_after_role(renderer):
+        pytest.skip(
+            f"{mm_model_name}: gen prompt injects tokens after assistant role "
+            "(e.g. `<think>\\n`); bridge preserves these from the past prompt "
+            "while a full re-render does not — they intentionally diverge. "
+            "Byte-parity against HF processor (the load-bearing check for "
+            "trainer correctness) is covered by the other tests in this file."
+        )
 
     initial = [
         {

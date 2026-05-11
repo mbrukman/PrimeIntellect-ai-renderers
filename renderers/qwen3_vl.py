@@ -225,6 +225,10 @@ class Qwen3VLRenderer:
         preserve_all_thinking / preserve_thinking_between_tool_calls:
             No-ops on Qwen3-VL — the chat template already drops past
             ``<think>`` blocks unconditionally. Stored for Protocol parity.
+        image_cache_max: Max entries in the per-instance image-processor
+            cache (FIFO eviction). Default 256 covers typical RL pools
+            (``rollouts_per_example`` × in-flight examples). Bump for runs
+            with large image sets where the working set exceeds the cap.
     """
 
     def __init__(
@@ -234,6 +238,7 @@ class Qwen3VLRenderer:
         processor: Any = None,
         preserve_all_thinking: bool = False,
         preserve_thinking_between_tool_calls: bool = False,
+        image_cache_max: int = 256,
     ):
         self._tokenizer = tokenizer
         self._processor = processor
@@ -263,7 +268,7 @@ class Qwen3VLRenderer:
         # tuples of ``(processor_out, num_image_tokens)`` — bounded to
         # avoid unbounded growth on long-lived pools.
         self._image_cache: dict[str, tuple[Any, int]] = {}
-        self._image_cache_max = 256
+        self._image_cache_max = image_cache_max
 
     def _token_id(self, token: str) -> int:
         tid = self._tokenizer.convert_tokens_to_ids(token)

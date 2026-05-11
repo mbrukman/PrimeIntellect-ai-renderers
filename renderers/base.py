@@ -400,6 +400,19 @@ MULTIMODAL_MODELS: dict[str, set[str]] = {
     "Qwen/Qwen3-VL-4B-Instruct": {"image"},
     "Qwen/Qwen3-VL-8B-Instruct": {"image"},
     "Qwen/Qwen3-VL-30B-A3B-Instruct": {"image"},
+    # Qwen3.5 is itself a VLM family (HF tag ``image-text-to-text``,
+    # processor class ``Qwen3VLProcessor``) — same vision tokens and
+    # image-processor as Qwen3-VL, with a different tool-call format.
+    "Qwen/Qwen3.5-0.8B": {"image"},
+    "Qwen/Qwen3.5-2B": {"image"},
+    "Qwen/Qwen3.5-4B": {"image"},
+    "Qwen/Qwen3.5-9B": {"image"},
+    "Qwen/Qwen3.5-35B-A3B": {"image"},
+    "Qwen/Qwen3.5-122B-A10B": {"image"},
+    "Qwen/Qwen3.5-397B-A17B": {"image"},
+    # Qwen3.6 extends Qwen3.5's chat template; same VL bits, only
+    # tool-call argument serialization differs.
+    "Qwen/Qwen3.6-35B-A3B": {"image"},
 }
 
 
