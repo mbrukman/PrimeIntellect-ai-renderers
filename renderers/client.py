@@ -24,12 +24,18 @@ from renderers.base import Message, MultiModalData, Renderer, RendererPool, Tool
 _request_logger = logging.getLogger("renderers.client")
 
 
-async def _run_pooled(pool: RendererPool, fn):
-    def _work():
-        with pool.checkout() as r:
-            return fn(r)
+async def _maybe_offload(renderer: Renderer | RendererPool, fn):
+    """Run sync renderer work on a thread iff ``renderer`` is a pool.
 
-    return await asyncio.to_thread(_work)
+    A pool's methods can block on its internal queue/lock (size>1 / size=1
+    fast path respectively), so we ``asyncio.to_thread`` to avoid stalling
+    the event loop. A bare ``Renderer`` runs inline — used in tests where
+    event-loop responsiveness isn't a concern and the thread hop would
+    be pure overhead.
+    """
+    if isinstance(renderer, RendererPool):
+        return await asyncio.to_thread(fn)
+    return fn()
 
 
 async def generate(
@@ -71,18 +77,13 @@ async def generate(
             "Choose a model-specific renderer instead of the default fallback."
         )
 
-    pool = renderer if isinstance(renderer, RendererPool) else None
-
-    def _prepare(r: Renderer):
+    def _prepare():
         if prompt_ids is not None:
-            return list(prompt_ids), r.get_stop_token_ids(), multi_modal_data
-        rendered = r.render(messages, tools=tools, add_generation_prompt=True)
-        return rendered.token_ids, r.get_stop_token_ids(), rendered.multi_modal_data
+            return list(prompt_ids), renderer.get_stop_token_ids(), multi_modal_data
+        rendered = renderer.render(messages, tools=tools, add_generation_prompt=True)
+        return rendered.token_ids, renderer.get_stop_token_ids(), rendered.multi_modal_data
 
-    if pool is not None:
-        prompt_ids, stop_token_ids, mm_data = await _run_pooled(pool, _prepare)
-    else:
-        prompt_ids, stop_token_ids, mm_data = _prepare(renderer)
+    prompt_ids, stop_token_ids, mm_data = await _maybe_offload(renderer, _prepare)
 
     sp: dict[str, Any] = dict(sampling_params or {})
     sp["stop_token_ids"] = stop_token_ids
@@ -137,10 +138,7 @@ async def generate(
     choice = (data.get("choices") or [{}])[0]
     completion_ids = choice.get("token_ids") or []
 
-    if pool is not None:
-        parsed = await _run_pooled(pool, lambda r: r.parse_response(completion_ids))
-    else:
-        parsed = renderer.parse_response(completion_ids)
+    parsed = await _maybe_offload(renderer, lambda: renderer.parse_response(completion_ids))
 
     # ChatCompletionLogProbs flatten: {"content": [{"logprob": ...}, ...]}
     raw_logprobs = choice.get("logprobs") or {}
@@ -209,19 +207,14 @@ def _build_mm_features(
     """
     from renderers.qwen3_vl import Qwen3VLRenderer
 
-    # When a pool was passed in, check out a slot to get a concrete instance
-    # to dispatch on. The slot's tokenizer / processor are unused — we only
-    # need its class for type dispatch.
-    sample_renderer: Renderer
-    if isinstance(renderer, RendererPool):
-        with renderer.checkout() as r:
-            sample_renderer = r
-            renderer_cls = type(r)
-    else:
-        sample_renderer = renderer
-        renderer_cls = type(renderer)
+    # Type dispatch only needs the renderer class. Pools expose
+    # ``renderer_cls`` as a snapshot attribute, so we don't have to check
+    # out a slot just to read ``type(r)``.
+    renderer_cls = (
+        renderer.renderer_cls if isinstance(renderer, RendererPool) else type(renderer)
+    )
 
-    if isinstance(sample_renderer, Qwen3VLRenderer):
+    if issubclass(renderer_cls, Qwen3VLRenderer):
         return _build_qwen_vl_features(mm_data, spatial_merge_size=2)
 
     raise NotImplementedError(

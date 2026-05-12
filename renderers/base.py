@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Protocol, TypedDict, runtime_checkable
@@ -327,34 +328,102 @@ class MultimodalRenderer(Renderer, Protocol):
         ...
 
 
+# Per-type cache for ``is_multimodal``. The ``runtime_checkable`` Protocol
+# isinstance check walks every protocol member via ``hasattr`` on each
+# call; per-type caching collapses that to a single dict lookup on the
+# hot path (e.g. per-bridge dispatch). Pools expose ``is_multimodal``
+# directly as a snapshot attribute (different pools share a class but
+# wrap different renderer types), so we don't need to special-case them.
+_IS_MULTIMODAL_BY_TYPE: dict[type, bool] = {}
+
+
+def is_multimodal(r: object) -> bool:
+    """True iff ``r`` satisfies the :class:`MultimodalRenderer` protocol.
+
+    Equivalent to ``isinstance(r, MultimodalRenderer)`` but cached. Use
+    this on hot paths (per-rollout, per-bridge dispatch) instead of
+    re-running the runtime_checkable Protocol walk on every call.
+    """
+    direct = getattr(r, "is_multimodal", None)
+    if isinstance(direct, bool):
+        return direct
+    cls = type(r)
+    cached = _IS_MULTIMODAL_BY_TYPE.get(cls)
+    if cached is None:
+        cached = isinstance(r, MultimodalRenderer)
+        _IS_MULTIMODAL_BY_TYPE[cls] = cached
+    return cached
+
+
 class RendererPool:
-    """Thread-safe pool of Renderer instances for parallel pretokenization.
+    """Pool of Renderer instances that itself satisfies the Renderer protocol.
 
-    Each Renderer wraps its own tokenizer copy, avoiding contention.
+    Callers treat a pool like a single renderer — ``pool.render_ids(...)``,
+    ``pool.bridge_to_next_turn(...)``, ``isinstance(pool, MultimodalRenderer)``
+    all work via structural delegation. The pool internally serializes
+    access to its inner renderers (each wraps its own tokenizer copy).
 
-    Construction parallelism matters: ``AutoTokenizer.from_pretrained`` takes
-    hundreds of ms per call (JSON parse + Rust tokenizer build + HF cache
-    lookup), so populating a 32-slot pool serially costs ~10-15s on startup
-    and shows up directly as a step-0 stall. We fan the factory out across a
-    short-lived thread pool; since HF fast tokenizers release the GIL during
-    the Rust build phase, this parallelizes well.
+    Concurrency model:
+    - ``size == 1``: a single inner renderer guarded by a ``threading.Lock``.
+      Avoids the queue's per-call overhead on the common default config.
+    - ``size > 1``: a ``queue.Queue`` of independent renderers, checked out
+      one at a time. HuggingFace fast tokenizers release the GIL during
+      Rust encoding, so threads achieve real parallelism.
+
+    Construction parallelism for ``size > 1``: ``AutoTokenizer.from_pretrained``
+    takes hundreds of ms per call (JSON parse + Rust tokenizer build + HF
+    cache lookup), so populating a 32-slot pool serially costs ~10-15s on
+    startup and shows up directly as a step-0 stall. We fan the factory out
+    across a short-lived thread pool; the GIL-bound Python portion stops
+    scaling past ~8 workers, so we clamp there.
     """
 
     def __init__(self, factory: Callable[[], Renderer], size: int):
         from concurrent.futures import ThreadPoolExecutor
 
         self._factory = factory
-        self._pool: queue.Queue[Renderer] = queue.Queue(maxsize=size)
-        # Cap workers so we don't spawn an oversized thread pool just to init
-        # a small pool; clamp to 8 because past that the GIL-bound Python
-        # portion of from_pretrained stops scaling.
-        workers = min(size, 8)
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            for renderer in executor.map(lambda _: factory(), range(size)):
-                self._pool.put(renderer)
+        self._size = size
+
+        if size == 1:
+            renderer = factory()
+            self._sole: Renderer | None = renderer
+            self._lock: threading.Lock | None = threading.Lock()
+            self._pool: queue.Queue[Renderer] | None = None
+            sample: Renderer = renderer
+        else:
+            self._sole = None
+            self._lock = None
+            self._pool = queue.Queue(maxsize=size)
+            workers = min(size, 8)
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                for renderer in executor.map(lambda _: factory(), range(size)):
+                    self._pool.put(renderer)
+            # Peek without removing — safe at construction time before any
+            # checkout has been served.
+            sample = self._pool.queue[0]
+
+        # Snapshot the protocol-shaped attributes from a sample renderer.
+        # They are constant per renderer class, so resolving them once at
+        # construction (a) eliminates per-call ``getattr``/``isinstance``
+        # overhead and (b) lets a future out-of-process pool variant skip
+        # holding a live tokenizer in the parent process.
+        self._renderer_cls: type[Renderer] = type(sample)
+        self.supports_tools: bool = getattr(sample, "supports_tools", True)
+        self.is_multimodal: bool = is_multimodal(sample)
+        self._mm_token_type_id_map: dict[int, int] | None = (
+            sample.mm_token_type_id_map
+            if isinstance(sample, MultimodalRenderer)
+            else None
+        )
 
     @contextmanager
     def checkout(self):
+        if self._sole is not None:
+            assert self._lock is not None
+            with self._lock:
+                yield self._sole
+            return
+        assert self._pool is not None
         renderer = self._pool.get()
         try:
             yield renderer
@@ -363,7 +432,54 @@ class RendererPool:
 
     @property
     def size(self) -> int:
-        return self._pool.maxsize
+        return self._size
+
+    @property
+    def renderer_cls(self) -> type[Renderer]:
+        """Class of the renderers in this pool (uniform across all slots)."""
+        return self._renderer_cls
+
+    # ── Renderer protocol delegation ────────────────────────────────────
+    # Pool structurally satisfies ``Renderer`` (and ``MultimodalRenderer``
+    # when its slots wrap multimodal renderers). Callers can call methods
+    # directly and dispatch with ``isinstance(pool, MultimodalRenderer)``
+    # without reaching into ``checkout()``.
+
+    def render(self, *args: Any, **kwargs: Any) -> "RenderedTokens":
+        with self.checkout() as r:
+            return r.render(*args, **kwargs)
+
+    def render_ids(self, *args: Any, **kwargs: Any) -> list[int]:
+        with self.checkout() as r:
+            return r.render_ids(*args, **kwargs)
+
+    def parse_response(self, *args: Any, **kwargs: Any) -> "ParsedResponse":
+        with self.checkout() as r:
+            return r.parse_response(*args, **kwargs)
+
+    def get_stop_token_ids(self) -> list[int]:
+        with self.checkout() as r:
+            return r.get_stop_token_ids()
+
+    def bridge_to_next_turn(
+        self, *args: Any, **kwargs: Any
+    ) -> "RenderedTokens | None":
+        with self.checkout() as r:
+            return r.bridge_to_next_turn(*args, **kwargs)
+
+    # ── MultimodalRenderer protocol attribute ──────────────────────────
+    # Only resolves on pools wrapping multimodal renderers. AttributeError
+    # for text-only pools, which ``runtime_checkable`` Protocol's
+    # ``hasattr`` check correctly interprets as "not a MultimodalRenderer".
+
+    @property
+    def mm_token_type_id_map(self) -> dict[int, int]:
+        if self._mm_token_type_id_map is None:
+            raise AttributeError(
+                f"{type(self).__name__} wrapping {self._renderer_cls.__name__} "
+                "is not a MultimodalRenderer; mm_token_type_id_map is undefined"
+            )
+        return self._mm_token_type_id_map
 
 
 RENDERER_REGISTRY: dict[str, type] = {}

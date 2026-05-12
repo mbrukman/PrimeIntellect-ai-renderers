@@ -22,6 +22,7 @@ from renderers.base import (
     build_trajectory_step,
     create_renderer,
     create_renderer_pool,
+    is_multimodal,
     reject_assistant_in_extension,
     trim_to_turn_close,
 )
@@ -76,6 +77,7 @@ __all__ = [
     "build_trajectory_step",
     "create_renderer",
     "create_renderer_pool",
+    "is_multimodal",
     "reject_assistant_in_extension",
     "trim_to_turn_close",
 ]
