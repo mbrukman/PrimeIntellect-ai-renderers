@@ -140,9 +140,10 @@ async def generate(
             "messages": [{"role": "user", "content": "(token-in mode)"}],
             "stream": False,
             "logprobs": True,
-            "stop": stop_token_ids,
             "nvext": nvext,
         }
+        if stop_token_ids:
+            body["stop"] = stop_token_ids
         if cache_salt is not None:
             body["cache_salt"] = cache_salt
 

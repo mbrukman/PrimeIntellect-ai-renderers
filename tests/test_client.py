@@ -49,6 +49,11 @@ class _FakeRenderer:
         )
 
 
+class _NoStopRenderer(_FakeRenderer):
+    def get_stop_token_ids(self):
+        return []
+
+
 class _FakeClient:
     """Mocks AsyncOpenAI's `.post()`. The renderer client builds an absolute
     URL off ``client.base_url``, so we expose one that includes the /v1 suffix
@@ -357,3 +362,34 @@ def test_generate_can_use_dynamo_transport():
     assert result["completion_ids"] == [7, 8]
     assert result["completion_logprobs"] == [-0.1, -0.2]
     assert result["finish_reason"] == "tool_calls"
+
+
+def test_generate_dynamo_omits_empty_stop_token_ids():
+    client = _FakeClient(
+        response={
+            "id": "chatcmpl-test",
+            "model": "test-model",
+            "nvext": {"completion_token_ids": [7, 8]},
+            "choices": [{"finish_reason": "stop"}],
+        }
+    )
+
+    asyncio.run(
+        generate(
+            client=client,
+            renderer=_NoStopRenderer(),
+            messages=[{"role": "user", "content": "hi"}],
+            model="test-model",
+            tools=[{"type": "function", "function": {"name": "echo"}}],
+            sampling_params={
+                "max_tokens": 7,
+                "stop": "caller-stop",
+                "stop_token_ids": [123],
+            },
+            transport="dynamo",
+        )
+    )
+
+    body = client.calls[0]["body"]
+    assert "stop" not in body
+    assert "stop_token_ids" not in body
