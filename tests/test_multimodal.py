@@ -425,14 +425,14 @@ def _build_tool_image_cases(make_part, image):
 
 
 def _supports_tool_message_images(renderer) -> bool:
-    """True iff this renderer emits image placeholders inside ``<tool_response>``
-    blocks. As of writing, only ``Qwen35Renderer`` (and its subclasses, e.g.
-    ``Qwen36Renderer``) has that path wired up; other VLM renderers (Qwen3-VL,
-    Kimi K2.5, …) silently drop image parts in tool content. As they grow the
-    feature, this predicate becomes their inclusion gate."""
+    """True iff this renderer emits image placeholders inside tool-response
+    content. Renderers without the feature silently drop image parts in tool
+    content; as they grow the feature they get added here and the test starts
+    asserting against them."""
+    from renderers.kimi_k25 import KimiK25Renderer
     from renderers.qwen35 import Qwen35Renderer
 
-    return isinstance(renderer, Qwen35Renderer)
+    return isinstance(renderer, (Qwen35Renderer, KimiK25Renderer))
 
 
 @pytest.mark.parametrize(
