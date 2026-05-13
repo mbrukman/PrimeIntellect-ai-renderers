@@ -190,12 +190,11 @@ async def run_one(
         ]
 
     # Turn 2: bridge extends prompt_ids + completion1 exactly.
-    bridged = renderer.bridge_to_next_turn(
+    bridged_ids = renderer.bridge_to_next_turn(
         prompt_ids, completion1, new_messages, tools=TOOLS
     )
-    if bridged is None:
+    if bridged_ids is None:
         raise RuntimeError("bridge_to_next_turn returned None")
-    bridged_ids = bridged.token_ids
     assert bridged_ids[: len(prompt_ids) + len(completion1)] == (
         prompt_ids + completion1
     )

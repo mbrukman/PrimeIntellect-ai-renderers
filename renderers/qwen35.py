@@ -820,9 +820,6 @@ class Qwen35Renderer:
             # content: text segments BPE-encode together up to a media
             # boundary, then each image emits ``<|vision_start|>`` + N×
             # ``<|image_pad|>`` + ``<|vision_end|>`` inline.
-            # ``_content_has_media`` returns False unless content is a list,
-            # but the type checker can't follow that through the call.
-            assert isinstance(raw_content, list)
             buf: list[str] = ["\n"]
 
             def flush_buf() -> None:
