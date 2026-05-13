@@ -80,9 +80,29 @@ class ToolCall(TypedDict, total=False):
     function: ToolCallFunction
 
 
-class ToolSpec(TypedDict):
-    """Tool specification (OpenAI function-calling format)."""
+class ToolFunctionSpec(TypedDict, total=False):
+    """Inner ``function`` block of the OpenAI envelope tool shape."""
 
+    name: str
+    description: str
+    parameters: dict[str, Any]
+
+
+class ToolSpec(TypedDict, total=False):
+    """Tool specification.
+
+    Renderers accept both shapes interchangeably:
+      * OpenAI envelope — ``{"type": "function", "function": {"name": ..., ...}}``
+      * Flat — ``{"name": ..., "description": ..., "parameters": ...}``
+
+    Normalization is consistently spelled ``tool.get("function") or tool``
+    across renderers, so every field is optional at the type level.
+    """
+
+    # OpenAI envelope shape
+    type: Literal["function"]
+    function: ToolFunctionSpec
+    # Flat shape
     name: str
     description: str
     parameters: dict[str, Any]
