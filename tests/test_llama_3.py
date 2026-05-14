@@ -41,15 +41,15 @@ def llama_pair(request):
 
 def test_canonical_meta_llama_paths_route_to_llama_3():
     for canonical, _ in _MODEL_PAIRS:
-        assert MODEL_RENDERER_MAP.get(canonical) == "llama_3", (
-            f"{canonical}: expected to route to 'llama_3'"
+        assert MODEL_RENDERER_MAP.get(canonical) == "llama-3", (
+            f"{canonical}: expected to route to 'llama-3'"
         )
 
 
 def test_create_renderer_via_explicit_name(llama_pair):
-    """The 'llama_3' string resolves to Llama3Renderer in the registry."""
+    """The 'llama-3' string resolves to Llama3Renderer in the registry."""
     _, _, tok, _ = llama_pair
-    r = create_renderer(tok, renderer="llama_3")
+    r = create_renderer(tok, renderer="llama-3")
     assert isinstance(r, Llama3Renderer)
 
 
