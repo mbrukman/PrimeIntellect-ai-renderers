@@ -136,7 +136,7 @@ async def generate(
             )
         nvext: dict[str, Any] = {
             "token_data": prompt_ids,
-            "extra_fields": ["completion_token_ids"],
+            "extra_fields": ["engine_data"],
         }
         if priority is not None:
             nvext["agent_hints"] = {"priority": priority}
@@ -151,7 +151,7 @@ async def generate(
         if tools:
             body["tools"] = tools
         if stop_token_ids:
-            body["stop"] = stop_token_ids
+            body["stop_token_ids"] = stop_token_ids
         if cache_salt is not None:
             nvext["cache_salt"] = cache_salt
 

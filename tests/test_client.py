@@ -308,7 +308,11 @@ def test_generate_can_use_dynamo_transport():
         response={
             "id": "chatcmpl-test",
             "model": "test-model",
-            "nvext": {"completion_token_ids": [7, 8]},
+            "nvext": {
+                "engine_data": {
+                    "completion_token_ids": [7, 8],
+                }
+            },
             "choices": [
                 {
                     "logprobs": {
@@ -348,11 +352,11 @@ def test_generate_can_use_dynamo_transport():
         "messages": [{"role": "user", "content": "(token-in mode)"}],
         "stream": False,
         "logprobs": True,
-        "stop": [99],
+        "stop_token_ids": [99],
         "tools": [{"type": "function", "function": {"name": "echo"}}],
         "nvext": {
             "token_data": [1, 2, 3],
-            "extra_fields": ["completion_token_ids"],
+            "extra_fields": ["engine_data"],
             "agent_hints": {"priority": 4},
             "cache_salt": "ckpt-42",
         },
@@ -372,7 +376,11 @@ def test_generate_dynamo_omits_empty_stop_token_ids():
         response={
             "id": "chatcmpl-test",
             "model": "test-model",
-            "nvext": {"completion_token_ids": [7, 8]},
+            "nvext": {
+                "engine_data": {
+                    "completion_token_ids": [7, 8],
+                }
+            },
             "choices": [{"finish_reason": "stop"}],
         }
     )
