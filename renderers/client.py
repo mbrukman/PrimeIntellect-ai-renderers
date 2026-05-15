@@ -1,7 +1,9 @@
-"""Renderer-based generate client for vLLM 0.20's /inference/v1/generate.
+"""Renderer-based generate client for vLLM 0.20 and Dynamo token-in routes.
 
-    messages → Renderer.render_ids() → token IDs → POST /inference/v1/generate
-    → completion tokens → Renderer.parse_response() → structured message
+Two transports are selected per call:
+
+    "prime_vllm_generate" → POST /inference/v1/generate
+    "dynamo_chat_nvext" → POST /chat/completions with nvext.token_data
 
 When a RendererPool is passed instead of a single Renderer, the sync tokenization
 and parsing work is offloaded to threads for parallel execution across rollouts.
@@ -28,7 +30,7 @@ from renderers.base import (
     ToolSpec,
 )
 
-RendererTransport = Literal["vllm", "dynamo"]
+RendererTransport = Literal["prime_vllm_generate", "dynamo_chat_nvext"]
 
 _request_logger = logging.getLogger("renderers.client")
 
@@ -60,7 +62,7 @@ async def generate(
     cache_salt: str | None = None,
     priority: int | None = None,
     extra_headers: dict[str, str] | None = None,
-    transport: RendererTransport = "vllm",
+    transport: RendererTransport = "prime_vllm_generate",
 ) -> dict[str, Any]:
     """Tokenize messages, call the selected token-in backend, parse response.
 
@@ -104,7 +106,7 @@ async def generate(
     sp["logprobs"] = 1
     sp.setdefault("skip_special_tokens", False)
 
-    if transport == "vllm":
+    if transport == "prime_vllm_generate":
         body: dict[str, Any] = {
             "model": model,
             "token_ids": prompt_ids,
@@ -127,7 +129,12 @@ async def generate(
         # AsyncOpenAI client doesn't prepend its automatic /v1.
         base = str(client.base_url).rstrip("/").removesuffix("/v1")
         endpoint = f"{base}/inference/v1/generate"
-    elif transport == "dynamo":
+    elif transport == "dynamo_chat_nvext":
+        if mm_data and not mm_data.is_empty():
+            raise NotImplementedError(
+                "Multimodal renderers are not yet supported on the "
+                "dynamo_chat_nvext transport."
+            )
         nvext: dict[str, Any] = {
             "token_data": prompt_ids,
             "extra_fields": ["completion_token_ids"],
@@ -142,10 +149,12 @@ async def generate(
             "logprobs": True,
             "nvext": nvext,
         }
+        if tools:
+            body["tools"] = tools
         if stop_token_ids:
             body["stop"] = stop_token_ids
         if cache_salt is not None:
-            body["cache_salt"] = cache_salt
+            nvext["cache_salt"] = cache_salt
 
         passthrough = dict(sp)
         passthrough.pop("stop_token_ids", None)
@@ -185,17 +194,25 @@ async def generate(
         raise
 
     choice = (data.get("choices") or [{}])[0]
-    if transport == "dynamo":
+    if transport == "dynamo_chat_nvext":
+        choice_nvext = choice.get("nvext") or {}
+        response_nvext = data.get("nvext") or {}
+        choice_engine_data = choice_nvext.get("engine_data") or {}
+        response_engine_data = response_nvext.get("engine_data") or {}
         completion_ids = (
             choice.get("token_ids")
-            or choice.get("nvext", {}).get("completion_token_ids")
-            or data.get("nvext", {}).get("completion_token_ids")
+            or choice_nvext.get("completion_token_ids")
+            or response_nvext.get("completion_token_ids")
+            or choice_engine_data.get("completion_token_ids")
+            or response_engine_data.get("completion_token_ids")
             or []
         )
         raw_re = (
             choice.get("routed_experts")
-            or choice.get("nvext", {}).get("routed_experts")
-            or data.get("nvext", {}).get("routed_experts")
+            or choice_nvext.get("routed_experts")
+            or response_nvext.get("routed_experts")
+            or choice_engine_data.get("routed_experts")
+            or response_engine_data.get("routed_experts")
         )
         request_id = data.get("id") or data.get("request_id") or ""
     else:
@@ -211,6 +228,15 @@ async def generate(
     raw_logprobs = choice.get("logprobs") or {}
     content_lp = raw_logprobs.get("content") if isinstance(raw_logprobs, dict) else None
     completion_logprobs = [float(c.get("logprob") or 0.0) for c in content_lp or []]
+    if not completion_logprobs and transport == "dynamo_chat_nvext":
+        choice_nvext = choice.get("nvext") or {}
+        response_nvext = data.get("nvext") or {}
+        engine_logprobs = (
+            (choice_nvext.get("engine_data") or {}).get("completion_logprobs")
+            or (response_nvext.get("engine_data") or {}).get("completion_logprobs")
+            or []
+        )
+        completion_logprobs = [float(logprob) for logprob in engine_logprobs]
 
     routed_experts = None
     if isinstance(raw_re, dict) and "data" in raw_re and "shape" in raw_re:

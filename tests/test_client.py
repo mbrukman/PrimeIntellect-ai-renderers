@@ -2,8 +2,10 @@ import asyncio
 import base64
 
 import numpy as np
+import pytest
 
 from renderers.base import (
+    MultiModalData,
     ParsedResponse,
     ParsedToolCall,
     RenderedTokens,
@@ -336,7 +338,7 @@ def test_generate_can_use_dynamo_transport():
             },
             priority=4,
             cache_salt="ckpt-42",
-            transport="dynamo",
+            transport="dynamo_chat_nvext",
         )
     )
 
@@ -347,12 +349,13 @@ def test_generate_can_use_dynamo_transport():
         "stream": False,
         "logprobs": True,
         "stop": [99],
+        "tools": [{"type": "function", "function": {"name": "echo"}}],
         "nvext": {
             "token_data": [1, 2, 3],
             "extra_fields": ["completion_token_ids"],
             "agent_hints": {"priority": 4},
+            "cache_salt": "ckpt-42",
         },
-        "cache_salt": "ckpt-42",
         "max_completion_tokens": 7,
         "temperature": 0.3,
         "min_tokens": 2,
@@ -386,10 +389,61 @@ def test_generate_dynamo_omits_empty_stop_token_ids():
                 "stop": "caller-stop",
                 "stop_token_ids": [123],
             },
-            transport="dynamo",
+            transport="dynamo_chat_nvext",
         )
     )
 
     body = client.calls[0]["body"]
     assert "stop" not in body
     assert "stop_token_ids" not in body
+
+
+def test_generate_dynamo_reads_engine_data_fallback():
+    client = _FakeClient(
+        response={
+            "id": "chatcmpl-test",
+            "model": "test-model",
+            "nvext": {
+                "engine_data": {
+                    "completion_token_ids": [7, 8],
+                    "completion_logprobs": [-0.3, -0.4],
+                }
+            },
+            "choices": [{"finish_reason": "stop"}],
+        }
+    )
+
+    result = asyncio.run(
+        generate(
+            client=client,
+            renderer=_FakeRenderer(),
+            messages=[{"role": "user", "content": "hi"}],
+            model="test-model",
+            prompt_ids=[1, 2, 3],
+            transport="dynamo_chat_nvext",
+        )
+    )
+
+    assert result["completion_ids"] == [7, 8]
+    assert result["completion_logprobs"] == [-0.3, -0.4]
+
+
+class _MultiModalRenderer(_FakeRenderer):
+    def render(self, messages, *, tools=None, add_generation_prompt=False):
+        return RenderedTokens(
+            token_ids=[1, 2, 3],
+            multi_modal_data=MultiModalData(mm_hashes={"image": ["aaa"]}),
+        )
+
+
+def test_generate_dynamo_rejects_multimodal_sidecar():
+    with pytest.raises(NotImplementedError, match="dynamo_chat_nvext"):
+        asyncio.run(
+            generate(
+                client=_FakeClient(),
+                renderer=_MultiModalRenderer(),
+                messages=[{"role": "user", "content": "hi"}],
+                model="test-model",
+                transport="dynamo_chat_nvext",
+            )
+        )
