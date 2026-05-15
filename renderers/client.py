@@ -2,8 +2,8 @@
 
 Two transports are selected per call:
 
-    "prime_vllm_generate" → POST /inference/v1/generate
-    "dynamo_chat_nvext" → POST /chat/completions with nvext.token_data
+    "vllm" → POST /inference/v1/generate
+    "dynamo" → POST /chat/completions with nvext.token_data
 
 When a RendererPool is passed instead of a single Renderer, the sync tokenization
 and parsing work is offloaded to threads for parallel execution across rollouts.
@@ -30,7 +30,7 @@ from renderers.base import (
     ToolSpec,
 )
 
-RendererTransport = Literal["prime_vllm_generate", "dynamo_chat_nvext"]
+RendererTransport = Literal["vllm", "dynamo"]
 
 _request_logger = logging.getLogger("renderers.client")
 
@@ -62,7 +62,7 @@ async def generate(
     cache_salt: str | None = None,
     priority: int | None = None,
     extra_headers: dict[str, str] | None = None,
-    transport: RendererTransport = "prime_vllm_generate",
+    transport: RendererTransport = "vllm",
 ) -> dict[str, Any]:
     """Tokenize messages, call the selected token-in backend, parse response.
 
@@ -106,7 +106,7 @@ async def generate(
     sp["logprobs"] = 1
     sp.setdefault("skip_special_tokens", False)
 
-    if transport == "prime_vllm_generate":
+    if transport == "vllm":
         body: dict[str, Any] = {
             "model": model,
             "token_ids": prompt_ids,
@@ -129,11 +129,10 @@ async def generate(
         # AsyncOpenAI client doesn't prepend its automatic /v1.
         base = str(client.base_url).rstrip("/").removesuffix("/v1")
         endpoint = f"{base}/inference/v1/generate"
-    elif transport == "dynamo_chat_nvext":
+    elif transport == "dynamo":
         if mm_data and not mm_data.is_empty():
             raise NotImplementedError(
-                "Multimodal renderers are not yet supported on the "
-                "dynamo_chat_nvext transport."
+                "Multimodal renderers are not yet supported on the dynamo transport."
             )
         nvext: dict[str, Any] = {
             "token_data": prompt_ids,
@@ -194,7 +193,7 @@ async def generate(
         raise
 
     choice = (data.get("choices") or [{}])[0]
-    if transport == "dynamo_chat_nvext":
+    if transport == "dynamo":
         choice_nvext = choice.get("nvext") or {}
         response_nvext = data.get("nvext") or {}
         choice_engine_data = choice_nvext.get("engine_data") or {}
@@ -228,7 +227,7 @@ async def generate(
     raw_logprobs = choice.get("logprobs") or {}
     content_lp = raw_logprobs.get("content") if isinstance(raw_logprobs, dict) else None
     completion_logprobs = [float(c.get("logprob") or 0.0) for c in content_lp or []]
-    if not completion_logprobs and transport == "dynamo_chat_nvext":
+    if not completion_logprobs and transport == "dynamo":
         choice_nvext = choice.get("nvext") or {}
         response_nvext = data.get("nvext") or {}
         engine_logprobs = (

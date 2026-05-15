@@ -338,7 +338,7 @@ def test_generate_can_use_dynamo_transport():
             },
             priority=4,
             cache_salt="ckpt-42",
-            transport="dynamo_chat_nvext",
+            transport="dynamo",
         )
     )
 
@@ -389,7 +389,7 @@ def test_generate_dynamo_omits_empty_stop_token_ids():
                 "stop": "caller-stop",
                 "stop_token_ids": [123],
             },
-            transport="dynamo_chat_nvext",
+            transport="dynamo",
         )
     )
 
@@ -420,7 +420,7 @@ def test_generate_dynamo_reads_engine_data_fallback():
             messages=[{"role": "user", "content": "hi"}],
             model="test-model",
             prompt_ids=[1, 2, 3],
-            transport="dynamo_chat_nvext",
+            transport="dynamo",
         )
     )
 
@@ -437,13 +437,13 @@ class _MultiModalRenderer(_FakeRenderer):
 
 
 def test_generate_dynamo_rejects_multimodal_sidecar():
-    with pytest.raises(NotImplementedError, match="dynamo_chat_nvext"):
+    with pytest.raises(NotImplementedError, match="dynamo transport"):
         asyncio.run(
             generate(
                 client=_FakeClient(),
                 renderer=_MultiModalRenderer(),
                 messages=[{"role": "user", "content": "hi"}],
                 model="test-model",
-                transport="dynamo_chat_nvext",
+                transport="dynamo",
             )
         )
