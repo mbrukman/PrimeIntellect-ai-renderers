@@ -169,6 +169,14 @@ class RenderedTokens:
     masking. ``DefaultRenderer`` leaves it empty because the Jinja
     template is opaque; hand-coded renderers populate it.
 
+    ``content_mask`` is a per-token signal for "actual message content":
+    ``True`` for tokens that come from a message's text / structured content,
+    ``False`` for renderer control tokens, role tags, separators, and
+    generation prompts. It is intentionally different from ``sampled_mask``:
+    tool outputs and user responses are prompt-side environment content, so
+    they are content but not sampled. Empty ``content_mask`` (``[]``) means the
+    renderer doesn't provide this signal.
+
     ``multi_modal_data`` is populated by multimodal renderers (e.g.
     ``Qwen3VLRenderer``) when image / video content parts are present;
     text-only renderers leave it as ``None``.
@@ -177,6 +185,7 @@ class RenderedTokens:
     token_ids: list[int] = field(default_factory=list)
     message_indices: list[int] = field(default_factory=list)
     sampled_mask: list[bool] = field(default_factory=list)
+    content_mask: list[bool] = field(default_factory=list)
     multi_modal_data: "MultiModalData | None" = None
 
 
@@ -839,8 +848,8 @@ def load_tokenizer(
 def _populate_registry():
     if RENDERER_REGISTRY:
         return
-    from renderers.default import DefaultRenderer
     from renderers.deepseek_v3 import DeepSeekV3Renderer
+    from renderers.default import DefaultRenderer
     from renderers.glm5 import GLM5Renderer, GLM51Renderer
     from renderers.glm45 import GLM45Renderer
     from renderers.gpt_oss import GptOssRenderer

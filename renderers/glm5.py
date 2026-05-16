@@ -143,17 +143,26 @@ class GLM5Renderer:
         tokens: list[int] = []
         indices: list[int] = []
         sampled: list[bool] = []
+        content_mask: list[bool] = []
 
         def emit_special(token_id: int, msg_idx: int, *, is_sampled: bool) -> None:
             tokens.append(token_id)
             indices.append(msg_idx)
             sampled.append(is_sampled)
+            content_mask.append(False)
 
-        def emit_text(text: str, msg_idx: int, *, is_sampled: bool) -> None:
+        def emit_text(
+            text: str,
+            msg_idx: int,
+            *,
+            is_sampled: bool,
+            is_content: bool = False,
+        ) -> None:
             ids = self._encode(text)
             tokens.extend(ids)
             indices.extend([msg_idx] * len(ids))
             sampled.extend([is_sampled] * len(ids))
+            content_mask.extend([is_content] * len(ids))
 
         # ── Prefix ──────────────────────────────────────────────────
         # ``[gMASK]<sop>`` is unconditional template scaffolding at the
@@ -180,11 +189,11 @@ class GLM5Renderer:
 
             if role == "system":
                 emit_special(self._system, i, is_sampled=False)
-                emit_text(content, i, is_sampled=False)
+                emit_text(content, i, is_sampled=False, is_content=True)
 
             elif role == "user":
                 emit_special(self._user, i, is_sampled=False)
-                emit_text(content, i, is_sampled=False)
+                emit_text(content, i, is_sampled=False, is_content=True)
 
             elif role == "assistant":
                 preserve_thinking = should_preserve_past_thinking(
@@ -220,7 +229,10 @@ class GLM5Renderer:
                 emit_special(self._think_end, -1, is_sampled=False)
 
         return RenderedTokens(
-            token_ids=tokens, message_indices=indices, sampled_mask=sampled
+            token_ids=tokens,
+            message_indices=indices,
+            sampled_mask=sampled,
+            content_mask=content_mask,
         )
 
     def render_ids(
@@ -305,7 +317,11 @@ class GLM5Renderer:
             ext.append(token_id)
 
         def emit_text(
-            text: str, _msg_idx: int = -1, *, is_sampled: bool = False
+            text: str,
+            _msg_idx: int = -1,
+            *,
+            is_sampled: bool = False,
+            is_content: bool = False,
         ) -> None:
             ext.extend(self._encode(text))
 
@@ -388,7 +404,12 @@ class GLM5Renderer:
             # template-injected scaffolding. The reasoning text and the
             # closing ``</think>`` are what the model actually samples.
             emit_special(self._think, msg_idx, is_sampled=False)
-            emit_text(reasoning_content.strip(), msg_idx, is_sampled=True)
+            emit_text(
+                reasoning_content.strip(),
+                msg_idx,
+                is_sampled=True,
+                is_content=True,
+            )
             emit_special(self._think_end, msg_idx, is_sampled=True)
         elif self.empty_think_on_last_assistant and msg_idx > last_user_index:
             # GLM-5.1: wrap the last assistant with an empty <think></think>
@@ -406,7 +427,7 @@ class GLM5Renderer:
             emit_special(self._think_end, msg_idx, is_sampled=False)
 
         if content.strip():
-            emit_text(content.strip(), msg_idx, is_sampled=True)
+            emit_text(content.strip(), msg_idx, is_sampled=True, is_content=True)
 
         # Tool calls (directly after content, no newlines)
         tool_calls = msg.get("tool_calls") or []
@@ -416,7 +437,7 @@ class GLM5Renderer:
             arguments = func.get("arguments", {})
 
             emit_special(self._tool_call_tok, msg_idx, is_sampled=True)
-            emit_text(name, msg_idx, is_sampled=True)
+            emit_text(name, msg_idx, is_sampled=True, is_content=True)
             # OpenAI canonical form: arguments is a JSON string. Parse it so the
             # per-argument rendering below still works.
             if isinstance(arguments, str):
@@ -427,16 +448,17 @@ class GLM5Renderer:
             if isinstance(arguments, dict):
                 for arg_name, arg_value in arguments.items():
                     emit_special(self._arg_key, msg_idx, is_sampled=True)
-                    emit_text(arg_name, msg_idx, is_sampled=True)
+                    emit_text(arg_name, msg_idx, is_sampled=True, is_content=True)
                     emit_special(self._arg_key_end, msg_idx, is_sampled=True)
                     emit_special(self._arg_value, msg_idx, is_sampled=True)
                     if isinstance(arg_value, str):
-                        emit_text(arg_value, msg_idx, is_sampled=True)
+                        emit_text(arg_value, msg_idx, is_sampled=True, is_content=True)
                     else:
                         emit_text(
                             json.dumps(arg_value, ensure_ascii=False),
                             msg_idx,
                             is_sampled=True,
+                            is_content=True,
                         )
                     emit_special(self._arg_value_end, msg_idx, is_sampled=True)
             emit_special(self._tool_call_end_tok, msg_idx, is_sampled=True)
@@ -459,7 +481,7 @@ class GLM5Renderer:
             emit_special(self._observation, msg_idx, is_sampled=False)
 
         emit_special(self._tool_response_tok, msg_idx, is_sampled=False)
-        emit_text(content, msg_idx, is_sampled=False)
+        emit_text(content, msg_idx, is_sampled=False, is_content=True)
         emit_special(self._tool_response_end_tok, msg_idx, is_sampled=False)
 
 
