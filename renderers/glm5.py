@@ -304,6 +304,8 @@ class GLM5Renderer:
         last_prev = previous_ids[-1]
 
         ext: list[int] = []
+        ext_indices: list[int] = []
+        ext_content_mask: list[bool] = []
 
         # Bridge output is consumed as the next turn's prompt — the
         # caller blanket-masks it via ``prompt_mask=[False]*N``, so we
@@ -315,6 +317,8 @@ class GLM5Renderer:
             token_id: int, _msg_idx: int = -1, *, is_sampled: bool = False
         ) -> None:
             ext.append(token_id)
+            ext_indices.append(_msg_idx)
+            ext_content_mask.append(False)
 
         def emit_text(
             text: str,
@@ -323,7 +327,10 @@ class GLM5Renderer:
             is_sampled: bool = False,
             is_content: bool = False,
         ) -> None:
-            ext.extend(self._encode(text))
+            ids = self._encode(text)
+            ext.extend(ids)
+            ext_indices.extend([_msg_idx] * len(ids))
+            ext_content_mask.extend([is_content] * len(ids))
 
         for i, msg in enumerate(new_messages):
             role = msg.get("role")
@@ -332,10 +339,10 @@ class GLM5Renderer:
                 # Dedup: model already emitted <|user|> as its stop token.
                 if not (i == 0 and last_prev == self._user):
                     emit_special(self._user, i)
-                emit_text(content, i)
+                emit_text(content, i, is_content=True)
             elif role == "system":
                 emit_special(self._system, i)
-                emit_text(content, i)
+                emit_text(content, i, is_content=True)
             elif role == "tool":
                 prev_is_tool = i > 0 and new_messages[i - 1].get("role") == "tool"
                 if i == 0 and last_prev == self._observation:
@@ -344,7 +351,7 @@ class GLM5Renderer:
                 elif not prev_is_tool:
                     emit_special(self._observation, i)
                 emit_special(self._tool_response_tok, i)
-                emit_text(content, i)
+                emit_text(content, i, is_content=True)
                 emit_special(self._tool_response_end_tok, i)
             else:
                 return None
@@ -356,7 +363,12 @@ class GLM5Renderer:
         else:
             emit_special(self._think_end, -1)
 
-        return RenderedTokens(token_ids=previous_ids + ext)
+        prefix_len = len(previous_ids)
+        return RenderedTokens(
+            token_ids=previous_ids + ext,
+            message_indices=[-1] * prefix_len + ext_indices,
+            content_mask=[False] * prefix_len + ext_content_mask,
+        )
 
     def _render_assistant(
         self,
