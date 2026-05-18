@@ -108,19 +108,51 @@ class Qwen3Renderer:
         tokens: list[int] = []
         indices: list[int] = []
         sampled: list[bool] = []
+        content_mask: list[bool] = []
 
-        def emit_ids(ids: list[int], msg_idx: int, *, is_sampled: bool) -> None:
+        def emit_ids(
+            ids: list[int], msg_idx: int, *, is_sampled: bool, is_content: bool = False
+        ) -> None:
             tokens.extend(ids)
             indices.extend([msg_idx] * len(ids))
             sampled.extend([is_sampled] * len(ids))
+            content_mask.extend([is_content] * len(ids))
 
         def emit_special(token_id: int, msg_idx: int, *, is_sampled: bool) -> None:
             tokens.append(token_id)
             indices.append(msg_idx)
             sampled.append(is_sampled)
+            content_mask.append(False)
 
-        def emit_text(text: str, msg_idx: int, *, is_sampled: bool) -> None:
-            emit_ids(self._encode(text), msg_idx, is_sampled=is_sampled)
+        def emit_text(
+            text: str, msg_idx: int, *, is_sampled: bool, is_content: bool = False
+        ) -> None:
+            emit_ids(
+                self._encode(text),
+                msg_idx,
+                is_sampled=is_sampled,
+                is_content=is_content,
+            )
+
+        def emit_content_text(
+            prefix: str,
+            content: str,
+            suffix: str,
+            msg_idx: int,
+            *,
+            is_sampled: bool,
+        ) -> None:
+            text = prefix + content + suffix
+            ids = self._encode(text)
+            prefix_len = len(self._encode(prefix))
+            suffix_len = len(self._encode(suffix))
+            content_end = max(prefix_len, len(ids) - suffix_len)
+            tokens.extend(ids)
+            indices.extend([msg_idx] * len(ids))
+            sampled.extend([is_sampled] * len(ids))
+            content_mask.extend(
+                [prefix_len <= pos < content_end for pos in range(len(ids))]
+            )
 
         # ── 1. System + tools ───────────────────────────────────────
         first_is_system = messages[0].get("role") == "system"
@@ -140,8 +172,12 @@ class Qwen3Renderer:
             emit_text("\n", sys_idx, is_sampled=False)
         elif first_is_system:
             emit_special(self._im_start, 0, is_sampled=False)
-            emit_text(
-                "system\n" + (messages[0].get("content") or ""), 0, is_sampled=False
+            emit_content_text(
+                "system\n",
+                messages[0].get("content") or "",
+                "",
+                0,
+                is_sampled=False,
             )
             emit_special(self._im_end, 0, is_sampled=False)
             emit_text("\n", 0, is_sampled=False)
@@ -159,13 +195,13 @@ class Qwen3Renderer:
                 if i == 0:
                     continue
                 emit_special(self._im_start, i, is_sampled=False)
-                emit_text(role + "\n" + content, i, is_sampled=False)
+                emit_content_text(role + "\n", content, "", i, is_sampled=False)
                 emit_special(self._im_end, i, is_sampled=False)
                 emit_text("\n", i, is_sampled=False)
 
             elif role == "user":
                 emit_special(self._im_start, i, is_sampled=False)
-                emit_text("user\n" + content, i, is_sampled=False)
+                emit_content_text("user\n", content, "", i, is_sampled=False)
                 emit_special(self._im_end, i, is_sampled=False)
                 emit_text("\n", i, is_sampled=False)
 
@@ -200,7 +236,10 @@ class Qwen3Renderer:
                 emit_text("<think>\n\n</think>\n\n", -1, is_sampled=False)
 
         return RenderedTokens(
-            token_ids=tokens, message_indices=indices, sampled_mask=sampled
+            token_ids=tokens,
+            message_indices=indices,
+            sampled_mask=sampled,
+            content_mask=content_mask,
         )
 
     def render_ids(
@@ -258,6 +297,8 @@ class Qwen3Renderer:
             return None
 
         ext: list[int] = []
+        ext_indices: list[int] = []
+        ext_content_mask: list[bool] = []
 
         # Bridge output is consumed as the next turn's prompt — the
         # caller blanket-masks it via ``prompt_mask=[False]*N``, so we
@@ -266,14 +307,42 @@ class Qwen3Renderer:
         # it; the returned ``RenderedTokens`` leaves ``sampled_mask``
         # empty.
         def emit_special(
-            token_id: int, _msg_idx: int = -1, *, is_sampled: bool = False
+            token_id: int, msg_idx: int = -1, *, is_sampled: bool = False
         ) -> None:
             ext.append(token_id)
+            ext_indices.append(msg_idx)
+            ext_content_mask.append(False)
 
         def emit_text(
-            text: str, _msg_idx: int = -1, *, is_sampled: bool = False
+            text: str,
+            msg_idx: int = -1,
+            *,
+            is_sampled: bool = False,
+            is_content: bool = False,
         ) -> None:
-            ext.extend(self._encode(text))
+            ids = self._encode(text)
+            ext.extend(ids)
+            ext_indices.extend([msg_idx] * len(ids))
+            ext_content_mask.extend([is_content] * len(ids))
+
+        def emit_content_text(
+            prefix: str,
+            content: str,
+            suffix: str,
+            msg_idx: int,
+            *,
+            is_sampled: bool = False,
+        ) -> None:
+            text = prefix + content + suffix
+            ids = self._encode(text)
+            prefix_len = len(self._encode(prefix))
+            suffix_len = len(self._encode(suffix))
+            content_end = max(prefix_len, len(ids) - suffix_len)
+            ext.extend(ids)
+            ext_indices.extend([msg_idx] * len(ids))
+            ext_content_mask.extend(
+                [prefix_len <= pos < content_end for pos in range(len(ids))]
+            )
 
         # Trailing ``\n`` after the turn-close token. ``render()`` emits this
         # as part of the prior turn, but vLLM stops on ``<|im_end|>`` so the
@@ -285,12 +354,12 @@ class Qwen3Renderer:
             content = msg.get("content") if isinstance(msg.get("content"), str) else ""
             if role == "user":
                 emit_special(self._im_start, i)
-                emit_text("user\n" + content, i)
+                emit_content_text("user\n", content, "", i)
                 emit_special(self._im_end, i)
                 emit_text("\n", i)
             elif role == "system":
                 emit_special(self._im_start, i)
-                emit_text("system\n" + content, i)
+                emit_content_text("system\n", content, "", i)
                 emit_special(self._im_end, i)
                 emit_text("\n", i)
             elif role == "tool":
@@ -309,7 +378,13 @@ class Qwen3Renderer:
         if not self._enable_thinking:
             emit_text("<think>\n\n</think>\n\n", -1)
 
-        return RenderedTokens(token_ids=previous_ids + ext)
+        rendered = RenderedTokens(
+            token_ids=previous_ids + ext,
+            message_indices=[-1] * len(previous_ids) + ext_indices,
+            content_mask=[False] * len(previous_ids) + ext_content_mask,
+        )
+        rendered.bridge_tail = list(new_messages)
+        return rendered
 
     def _render_assistant(
         self,
@@ -366,7 +441,7 @@ class Qwen3Renderer:
             body = content
 
         if not tool_calls:
-            emit_text(body, msg_idx, is_sampled=True)
+            emit_text(body, msg_idx, is_sampled=True, is_content=True)
         else:
             for tc_idx, tc in enumerate(tool_calls):
                 func = tc.get("function") or tc
@@ -381,7 +456,12 @@ class Qwen3Renderer:
                 # Text before this tool_call (includes separator)
                 if tc_idx == 0:
                     separator = "\n" if content else ""
-                    emit_text(body + separator, msg_idx, is_sampled=True)
+                    emit_text(
+                        body + separator,
+                        msg_idx,
+                        is_sampled=True,
+                        is_content=True,
+                    )
                 else:
                     emit_text("\n", msg_idx, is_sampled=True)
 
@@ -390,6 +470,7 @@ class Qwen3Renderer:
                     '\n{"name": "' + name + '", "arguments": ' + args_str + "}\n",
                     msg_idx,
                     is_sampled=True,
+                    is_content=True,
                 )
                 emit_special(self._tool_call_end, msg_idx, is_sampled=True)
 
@@ -422,7 +503,7 @@ class Qwen3Renderer:
 
         emit_text("\n", msg_idx, is_sampled=False)
         emit_special(self._tool_response, msg_idx, is_sampled=False)
-        emit_text("\n" + content + "\n", msg_idx, is_sampled=False)
+        emit_content_text("\n", content, "\n", msg_idx, is_sampled=False)
         emit_special(self._tool_response_end, msg_idx, is_sampled=False)
 
         if not next_is_tool:
