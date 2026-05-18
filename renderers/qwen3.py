@@ -225,7 +225,12 @@ class Qwen3Renderer:
 
             elif role == "tool":
                 self._render_tool(
-                    messages, i, content, emit_special=emit_special, emit_text=emit_text
+                    messages,
+                    i,
+                    content,
+                    emit_special=emit_special,
+                    emit_text=emit_text,
+                    emit_content_text=emit_content_text,
                 )
 
         # ── 4. Generation prompt ────────────────────────────────────
@@ -369,6 +374,7 @@ class Qwen3Renderer:
                     content,
                     emit_special=emit_special,
                     emit_text=emit_text,
+                    emit_content_text=emit_content_text,
                 )
             else:
                 return None
@@ -488,6 +494,7 @@ class Qwen3Renderer:
         *,
         emit_special,
         emit_text,
+        emit_content_text,
     ) -> None:
         # Tool messages are conversation history injected by the runtime
         # between assistant turns — the model never samples any of these
