@@ -16,6 +16,7 @@ failure) — see ``ToolCallParseStatus`` docstring for the rationale.
 
 from __future__ import annotations
 
+import ast
 import json
 from typing import Any
 
@@ -29,8 +30,21 @@ from renderers.base import ParsedResponse, ParsedToolCall, ToolCallParseStatus, 
 # ``"true"`` produce identical wire bytes; without the tool schema, the
 # parser has no signal to distinguish them and defaults to
 # ``json.loads`` (the historical behavior). When the caller passes
-# ``tools=[...]``, parsers consult the per-parameter declared type to
-# keep string args verbatim, matching vLLM / SGLang reference parsers.
+# ``tools=[...]``, parsers consult the per-parameter declared type and
+# dispatch through a vLLM-parity ladder (case-insensitive ``null``,
+# ``int()`` / ``float()`` for numeric, ``.lower() == "true"`` for bool,
+# ``json.loads`` → ``ast.literal_eval`` for object/array) so models can
+# emit Pythonic literals like ``True`` / ``None`` / ``{'k': 1}`` that
+# both SGLang's ``Qwen3CoderDetector`` and vLLM's
+# ``Qwen3CoderToolParser`` accept on the inference side.
+
+
+_STRING_TYPES = frozenset({"string", "str", "text", "varchar", "char", "enum"})
+_BOOL_TYPES = frozenset({"boolean", "bool", "binary"})
+_OBJECT_TYPES = frozenset({"object", "array", "arr"})
+_INT_PREFIXES = ("int", "uint", "long", "short", "unsigned")
+_FLOAT_PREFIXES = ("num", "float")
+_OBJECT_PREFIXES = ("dict", "list")
 
 
 def _build_param_type_index(
@@ -59,35 +73,119 @@ def _build_param_type_index(
     return index
 
 
+def _declared_type(param_schema: dict[str, Any] | None) -> str | None:
+    """Extract the lowercased ``type`` from a JSON-schema fragment.
+
+    Mirrors vLLM: a fragment with ``anyOf`` and no top-level ``type`` is
+    treated as ``"object"`` so json.loads is attempted; a list-form type
+    falls back to the first declared entry.
+    """
+    if not isinstance(param_schema, dict):
+        return None
+    declared = param_schema.get("type")
+    if isinstance(declared, str):
+        return declared.strip().lower()
+    if isinstance(declared, list) and declared:
+        first = declared[0]
+        if isinstance(first, str):
+            return first.strip().lower()
+    if "anyOf" in param_schema:
+        return "object"
+    return None
+
+
 def _coerce_arg_value(
     text: str, param_schema: dict[str, Any] | None
 ) -> tuple[Any, bool]:
     """Coerce a raw ``<arg_value>`` body to its declared type.
 
-    Returns ``(value, used_json_fallback)``. The boolean is ``True`` only
-    when ``json.loads`` was attempted and raised, so the caller knows
-    whether to flag ``INVALID_JSON``. Returning a string verbatim
-    because the schema declared ``type: "string"`` is NOT a fallback.
+    Returns ``(value, used_fallback)``. ``used_fallback=True`` means the
+    coercion could not satisfy the declared type and had to fall back to
+    a different shape (a string for scalars, ``False`` for booleans, raw
+    text for objects), so the caller can flag ``INVALID_JSON``.
 
-    Rule (matches vLLM / SGLang reference parsers):
+    The ladder mirrors vLLM's ``Qwen3CoderToolParser._convert_param_value``
+    and SGLang's ``Qwen3CoderDetector._convert_param_value`` with one
+    deliberate deviation noted inline:
 
-    - If the param's declared ``type`` is ``"string"`` (or single-element
-      ``["string"]``), return ``text`` verbatim — never ``json.loads``.
-    - Anything else (no schema, non-string scalar, object, array, or
-      union types that include non-string): try ``json.loads`` and fall
-      back to raw ``text`` on parse failure.
-
-    Union types that include ``"string"`` alongside other types still
-    attempt ``json.loads`` first so an explicit integer / bool can
-    parse; the string branch only wins as the fallback.
+    - No schema → try ``json.loads``, fall back to raw text + INVALID.
+    - ``string`` / ``str`` / ``text`` / ``varchar`` / ``char`` / ``enum``
+      → return verbatim. (Deviation: vLLM/SGLang null-coerce ``"null"``
+      *before* checking type, so a string-typed arg of ``"null"`` would
+      come back as Python ``None``. Renderers preserves the string
+      because the XML wire format can't distinguish the string
+      ``"null"`` from JSON null, and downstream tests pin the
+      preservation contract; see ``test_tool_arg_type_preservation``.)
+    - ``null`` (any case) for any non-string declared type → ``None``.
+    - ``int`` / ``uint`` / ``long`` / ``short`` / ``unsigned`` family →
+      ``int(text)``, degenerating to raw text + INVALID.
+    - ``num`` / ``float`` family → ``float(text)`` with int demotion
+      when the source has no ``.``/``e`` and is whole, degenerating to
+      raw text + INVALID.
+    - ``boolean`` / ``bool`` / ``binary`` → ``text.lower() == "true"``;
+      anything outside ``{"true", "false"}`` returns ``False`` + INVALID
+      (matches vLLM's "degenerate to false" behavior, with the
+      INVALID flag preserved for the verifier / RL-loss signal).
+    - ``object`` / ``array`` / ``dict`` / ``list`` (or ``anyOf``) →
+      ``json.loads`` first, ``ast.literal_eval`` fallback (for Python
+      literals like ``{'k': 1}``), raw text + INVALID otherwise.
+    - Unknown type (param missing from schema, or type not in any
+      family above) → ``ast.literal_eval`` if it parses, else raw text.
+      Matches vLLM's catch-all branch and keeps strings like
+      ``"hello"`` (with no schema entry) as-is.
     """
-    if param_schema is not None:
-        declared = param_schema.get("type")
-        if declared == "string" or declared == ["string"]:
-            return text, False
+    if param_schema is None:
+        if text.lower() == "null":
+            return None, False
+        try:
+            return json.loads(text), False
+        except (json.JSONDecodeError, ValueError):
+            return text, True
+
+    declared = _declared_type(param_schema)
+
+    if declared is None or declared in _STRING_TYPES:
+        return text, False
+
+    if text.lower() == "null":
+        return None, False
+
+    if declared.startswith(_INT_PREFIXES):
+        try:
+            return int(text), False
+        except (ValueError, TypeError):
+            return text, True
+
+    if declared.startswith(_FLOAT_PREFIXES):
+        try:
+            f = float(text)
+        except (ValueError, TypeError):
+            return text, True
+        if "." not in text and "e" not in text.lower() and f.is_integer():
+            return int(f), False
+        return f, False
+
+    if declared in _BOOL_TYPES:
+        lowered = text.lower()
+        if lowered == "true":
+            return True, False
+        if lowered == "false":
+            return False, False
+        return False, True
+
+    if declared in _OBJECT_TYPES or declared.startswith(_OBJECT_PREFIXES):
+        try:
+            return json.loads(text), False
+        except (json.JSONDecodeError, ValueError):
+            pass
+        try:
+            return ast.literal_eval(text), False
+        except (ValueError, SyntaxError, TypeError, MemoryError):
+            return text, True
+
     try:
-        return json.loads(text), False
-    except (json.JSONDecodeError, ValueError):
+        return ast.literal_eval(text), False
+    except (ValueError, SyntaxError, TypeError, MemoryError):
         return text, True
 
 
