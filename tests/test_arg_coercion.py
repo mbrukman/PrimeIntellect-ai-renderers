@@ -158,7 +158,9 @@ def test_anyof_treated_as_object():
     assert used_fallback is False
 
 
-@pytest.mark.parametrize("declared", ["string", "str", "text", "varchar", "char", "enum"])
+@pytest.mark.parametrize(
+    "declared", ["string", "str", "text", "varchar", "char", "enum"]
+)
 def test_string_family_returns_verbatim(declared):
     value, used_fallback = _coerce_arg_value("True", {"type": declared})
     assert value == "True"
@@ -171,18 +173,32 @@ def test_string_with_list_form_type():
     assert used_fallback is False
 
 
-def test_no_schema_falls_back_to_json_loads():
-    """Historical behavior: when ``param_schema`` is ``None`` (no tools
-    were passed), we still try ``json.loads`` for backwards compatibility
-    so untyped numbers / bools parse. ``None`` is handled via the
-    ``null`` short-circuit at the top of the ladder."""
+def test_no_schema_returns_verbatim_string():
+    """vLLM ``qwen3coder_tool_parser.py:128-137``: when the param is
+    not in the tool schema (or no tools were passed at all), the parser
+    returns the raw text verbatim — it does **not** try ``json.loads``.
+    The case-insensitive ``null`` short-circuit at the top of the ladder
+    still applies (so untyped ``"null"`` becomes Python ``None``)."""
     value, used_fallback = _coerce_arg_value("42", None)
-    assert value == 42
+    assert value == "42"
+    assert used_fallback is False
+
+    value, used_fallback = _coerce_arg_value("True", None)
+    assert value == "True"
     assert used_fallback is False
 
     value, used_fallback = _coerce_arg_value("hello", None)
     assert value == "hello"
-    assert used_fallback is True
+    assert used_fallback is False
+
+
+def test_no_schema_null_short_circuit():
+    """vLLM null-coerces before the schema-missing return, so an untyped
+    ``"null"`` still becomes Python ``None``."""
+    for raw in ("null", "Null", "NULL"):
+        value, used_fallback = _coerce_arg_value(raw, None)
+        assert value is None
+        assert used_fallback is False
 
 
 def test_unknown_type_falls_back_to_literal_eval():
@@ -222,26 +238,9 @@ _TOOLS_FROM_ISSUE = [
 ]
 
 
-def test_qwen35_capital_true_for_boolean_is_ok_status():
-    """Regression for issue #47: ``<parameter=include_files>True</parameter>``
-    used to be flagged ``INVALID_JSON`` because ``json.loads("True")``
-    fails. SGLang and vLLM both accept it via case-folded comparison;
-    renderers now does too."""
-    tok = load_tokenizer("Qwen/Qwen3.5-9B")
-
-    completion = (
-        "<tool_call>\n"
-        "<function=filesystem_server_get_directory_tree>\n"
-        "<parameter=path>/</parameter>\n"
-        "<parameter=max_depth>2</parameter>\n"
-        "<parameter=include_files>True</parameter>\n"
-        "<parameter=show_size>True</parameter>\n"
-        "</function>\n"
-        "</tool_call>"
-    )
+def _parse(tok, completion: str, *, tools=None):
     ids = tok.encode(completion, add_special_tokens=False)
-
-    parsed = parse_qwen35(
+    return parse_qwen35(
         tok,
         list(ids),
         stop_ids={tok.eos_token_id} if tok.eos_token_id is not None else set(),
@@ -249,6 +248,26 @@ def test_qwen35_capital_true_for_boolean_is_ok_status():
         think_end_id=tok.convert_tokens_to_ids("</think>"),
         tool_call_id=tok.convert_tokens_to_ids("<tool_call>"),
         tool_call_end_id=tok.convert_tokens_to_ids("</tool_call>"),
+        tools=tools,
+    )
+
+
+def test_qwen35_capital_true_for_boolean_is_ok_status():
+    """Regression for issue #47: ``<parameter=include_files>True</parameter>``
+    used to be flagged ``INVALID_JSON`` because ``json.loads("True")``
+    fails. SGLang and vLLM both accept it via case-folded comparison;
+    renderers now does too."""
+    tok = load_tokenizer("Qwen/Qwen3.5-9B")
+    parsed = _parse(
+        tok,
+        "<tool_call>\n"
+        "<function=filesystem_server_get_directory_tree>\n"
+        "<parameter=path>/</parameter>\n"
+        "<parameter=max_depth>2</parameter>\n"
+        "<parameter=include_files>True</parameter>\n"
+        "<parameter=show_size>True</parameter>\n"
+        "</function>\n"
+        "</tool_call>",
         tools=_TOOLS_FROM_ISSUE,
     )
     assert len(parsed.tool_calls) == 1
@@ -261,3 +280,99 @@ def test_qwen35_capital_true_for_boolean_is_ok_status():
         "include_files": True,
         "show_size": True,
     }
+
+
+# ── Structural tolerance: parity with vLLM's three regex patterns ────
+
+
+def test_qwen35_tolerates_missing_closing_parameter():
+    """vLLM ``tool_call_parameter_regex`` uses positive lookaheads so a
+    missing ``</parameter>`` is recovered from the next ``<parameter=``
+    or ``</function>`` boundary instead of dropping the value."""
+    tok = load_tokenizer("Qwen/Qwen3.5-9B")
+    parsed = _parse(
+        tok,
+        "<tool_call>\n"
+        "<function=filesystem_server_get_directory_tree>\n"
+        "<parameter=path>/\n"  # missing </parameter>
+        "<parameter=max_depth>2</parameter>\n"
+        "</function>\n"
+        "</tool_call>",
+        tools=_TOOLS_FROM_ISSUE,
+    )
+    assert len(parsed.tool_calls) == 1
+    tc = parsed.tool_calls[0]
+    assert tc.status == ToolCallParseStatus.OK
+    assert tc.name == "filesystem_server_get_directory_tree"
+    assert tc.arguments == {"path": "/", "max_depth": 2}
+
+
+def test_qwen35_tolerates_unclosed_function():
+    """vLLM ``tool_call_function_regex`` second alternation matches an
+    unclosed ``<function=…`` body to end-of-text; we still flag the
+    surrounding diagnostic via ``UNCLOSED_BLOCK`` but recover the call."""
+    tok = load_tokenizer("Qwen/Qwen3.5-9B")
+    parsed = _parse(
+        tok,
+        "<tool_call>\n"
+        "<function=filesystem_server_get_directory_tree>\n"
+        "<parameter=path>/</parameter>\n",  # no </function>, no </tool_call>
+        tools=_TOOLS_FROM_ISSUE,
+    )
+    assert len(parsed.tool_calls) == 1
+    tc = parsed.tool_calls[0]
+    assert tc.status == ToolCallParseStatus.UNCLOSED_BLOCK
+    assert tc.name == "filesystem_server_get_directory_tree"
+    assert tc.arguments == {"path": "/"}
+
+
+def test_qwen35_backoff_no_tool_call_markers():
+    """vLLM ``qwen3coder_tool_parser.py:269-271``: when the output
+    contains no ``<tool_call>`` markers, treat the whole completion as
+    a single tool-call region and scan for ``<function=…>`` directly."""
+    tok = load_tokenizer("Qwen/Qwen3.5-9B")
+    parsed = _parse(
+        tok,
+        "sure, calling now.\n"
+        "<function=filesystem_server_get_directory_tree>\n"
+        "<parameter=path>/etc</parameter>\n"
+        "<parameter=max_depth>1</parameter>\n"
+        "</function>",
+        tools=_TOOLS_FROM_ISSUE,
+    )
+    assert len(parsed.tool_calls) == 1
+    tc = parsed.tool_calls[0]
+    assert tc.status == ToolCallParseStatus.OK
+    assert tc.name == "filesystem_server_get_directory_tree"
+    assert tc.arguments == {"path": "/etc", "max_depth": 1}
+    assert "sure, calling now" in parsed.content
+
+
+def test_qwen35_backoff_returns_no_calls_when_no_function_either():
+    """No ``<tool_call>`` and no ``<function=`` → no recovered calls,
+    full text returned as content."""
+    tok = load_tokenizer("Qwen/Qwen3.5-9B")
+    parsed = _parse(tok, "just a chat reply", tools=_TOOLS_FROM_ISSUE)
+    assert parsed.tool_calls == []
+    assert parsed.content == "just a chat reply"
+
+
+def test_qwen35_parameter_value_preserves_internal_whitespace():
+    """vLLM strips exactly one leading and one trailing ``\\n`` from the
+    parameter body (``qwen3coder_tool_parser.py:246-250``); inner
+    indentation must round-trip verbatim."""
+    tok = load_tokenizer("Qwen/Qwen3.5-9B")
+    parsed = _parse(
+        tok,
+        "<tool_call>\n"
+        "<function=filesystem_server_get_directory_tree>\n"
+        "<parameter=path>\n  /etc  \n</parameter>\n"
+        "</function>\n"
+        "</tool_call>",
+        tools=_TOOLS_FROM_ISSUE,
+    )
+    assert len(parsed.tool_calls) == 1
+    tc = parsed.tool_calls[0]
+    assert tc.status == ToolCallParseStatus.OK
+    # One leading + one trailing \n stripped — interior spaces preserved.
+    assert tc.arguments == {"path": "  /etc  "}

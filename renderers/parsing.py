@@ -18,25 +18,60 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 from typing import Any
 
 from renderers.base import ParsedResponse, ParsedToolCall, ToolCallParseStatus, ToolSpec
 
 
+# ── vLLM Qwen3CoderToolParser regex patterns ────────────────────────
+#
+# Lifted verbatim from ``vllm/tool_parsers/qwen3coder_tool_parser.py``
+# (``self.tool_call_regex`` / ``tool_call_function_regex`` /
+# ``tool_call_parameter_regex``). Each pattern has two branches: one
+# for the closed form (with the matching end tag) and one anchored at
+# end-of-string for unclosed output. The parameter regex uses
+# positive lookaheads so a missing ``</parameter>`` is recovered from
+# the next ``<parameter=`` / ``</function>`` boundary instead of
+# silently dropping the value.
+
+_TOOL_CALL_BLOCK_RE = re.compile(
+    r"<tool_call>(.*?)</tool_call>|<tool_call>(.*?)$", re.DOTALL
+)
+_FUNCTION_BLOCK_RE = re.compile(
+    r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
+)
+_PARAMETER_BLOCK_RE = re.compile(
+    r"<parameter=(.*?)(?:</parameter>|(?=<parameter=)|(?=</function>)|$)",
+    re.DOTALL,
+)
+
+
 # ── Schema-aware argument coercion ──────────────────────────────────
 #
 # XML-style tool-call formats render argument values verbatim inside
-# ``<arg_value>`` tags with no quoting. ``true`` and the string
+# ``<parameter=…>`` tags with no quoting. ``true`` and the string
 # ``"true"`` produce identical wire bytes; without the tool schema, the
-# parser has no signal to distinguish them and defaults to
-# ``json.loads`` (the historical behavior). When the caller passes
-# ``tools=[...]``, parsers consult the per-parameter declared type and
-# dispatch through a vLLM-parity ladder (case-insensitive ``null``,
-# ``int()`` / ``float()`` for numeric, ``.lower() == "true"`` for bool,
-# ``json.loads`` → ``ast.literal_eval`` for object/array) so models can
-# emit Pythonic literals like ``True`` / ``None`` / ``{'k': 1}`` that
-# both SGLang's ``Qwen3CoderDetector`` and vLLM's
-# ``Qwen3CoderToolParser`` accept on the inference side.
+# parser has no signal to distinguish them. We mirror vLLM's
+# ``Qwen3CoderToolParser`` (and SGLang's ``Qwen3CoderDetector``) end to
+# end: case-insensitive ``null`` short-circuit, ``int()`` / ``float()``
+# for numeric types, ``.lower() == "true"`` for bool, ``json.loads``
+# with ``ast.literal_eval`` fallback for objects/arrays. That accepts
+# both JSON literals (Qwen3.6) and Python literals (Qwen3.5 — ``str()``
+# renders bools as ``True`` / ``False``) on the inference side.
+#
+# Why ``qwen3_coder`` and not ``qwen3_xml``: vLLM ships two parsers for
+# the same wire format. ``qwen3_xml`` is the newer streaming-first
+# parser (uses ``xml.parsers.expat`` and is the recommended choice for
+# *live serving* because ``qwen3_coder`` has known infinite-loop bugs
+# in vLLM's streaming path). For offline token-level extraction the
+# two parsers agree on JSON-literal scalars but ``qwen3_coder`` is a
+# strict superset for value coercion — it accepts Python literals via
+# ``ast.literal_eval`` where ``qwen3_xml`` returns raw strings. Since
+# this repo doesn't stream yet, ``qwen3_coder`` semantics dominate.
+# TODO: when a streaming parse API lands, switch the streaming path to
+# ``qwen3_xml``-style state-machine semantics to dodge vLLM's
+# regex-streaming bugs (see HF Qwen3-Coder-Next discussion #17).
 
 
 _STRING_TYPES = frozenset({"string", "str", "text", "varchar", "char", "enum"})
@@ -97,7 +132,7 @@ def _declared_type(param_schema: dict[str, Any] | None) -> str | None:
 def _coerce_arg_value(
     text: str, param_schema: dict[str, Any] | None
 ) -> tuple[Any, bool]:
-    """Coerce a raw ``<arg_value>`` body to its declared type.
+    """Coerce a raw ``<parameter=…>`` body to its declared type.
 
     Returns ``(value, used_fallback)``. ``used_fallback=True`` means the
     coercion could not satisfy the declared type and had to fall back to
@@ -108,7 +143,11 @@ def _coerce_arg_value(
     and SGLang's ``Qwen3CoderDetector._convert_param_value`` with one
     deliberate deviation noted inline:
 
-    - No schema → try ``json.loads``, fall back to raw text + INVALID.
+    - ``null`` short-circuit (any case) → ``None`` for any declared
+      type **except** the string family (see deviation below).
+    - No schema OR param not in schema → return verbatim (after the
+      null short-circuit). vLLM ``qwen3coder_tool_parser.py:128-137``:
+      ``if param_name not in param_config: return param_value``.
     - ``string`` / ``str`` / ``text`` / ``varchar`` / ``char`` / ``enum``
       → return verbatim. (Deviation: vLLM/SGLang null-coerce ``"null"``
       *before* checking type, so a string-typed arg of ``"null"`` would
@@ -116,7 +155,6 @@ def _coerce_arg_value(
       because the XML wire format can't distinguish the string
       ``"null"`` from JSON null, and downstream tests pin the
       preservation contract; see ``test_tool_arg_type_preservation``.)
-    - ``null`` (any case) for any non-string declared type → ``None``.
     - ``int`` / ``uint`` / ``long`` / ``short`` / ``unsigned`` family →
       ``int(text)``, degenerating to raw text + INVALID.
     - ``num`` / ``float`` family → ``float(text)`` with int demotion
@@ -129,26 +167,19 @@ def _coerce_arg_value(
     - ``object`` / ``array`` / ``dict`` / ``list`` (or ``anyOf``) →
       ``json.loads`` first, ``ast.literal_eval`` fallback (for Python
       literals like ``{'k': 1}``), raw text + INVALID otherwise.
-    - Unknown type (param missing from schema, or type not in any
-      family above) → ``ast.literal_eval`` if it parses, else raw text.
-      Matches vLLM's catch-all branch and keeps strings like
-      ``"hello"`` (with no schema entry) as-is.
+    - Any other declared type → ``ast.literal_eval`` if it parses, else
+      raw text. Matches vLLM's catch-all else branch.
     """
-    if param_schema is None:
-        if text.lower() == "null":
-            return None, False
-        try:
-            return json.loads(text), False
-        except (json.JSONDecodeError, ValueError):
-            return text, True
-
     declared = _declared_type(param_schema)
 
-    if declared is None or declared in _STRING_TYPES:
-        return text, False
-
-    if text.lower() == "null":
+    # vLLM null short-circuit runs BEFORE the schema-missing check, but
+    # is suppressed for declared string types so the wire-format
+    # ambiguity is resolved in favour of the explicit schema.
+    if declared not in _STRING_TYPES and text.lower() == "null":
         return None, False
+
+    if param_schema is None or declared is None or declared in _STRING_TYPES:
+        return text, False
 
     if declared.startswith(_INT_PREFIXES):
         try:
@@ -353,6 +384,7 @@ def parse_qwen35(
 
     tc_start = _find(ids, tool_call_id)
     tool_calls: list[ParsedToolCall] = []
+    param_index = _build_param_type_index(tools)
     if tc_start != -1:
         content_text = _decode(tokenizer, ids[:tc_start]).strip()
         tool_calls = _parse_xml_tool_calls(
@@ -361,10 +393,25 @@ def parse_qwen35(
             tool_call_id,
             tool_call_end_id,
             section_offset=parse_offset + tc_start,
-            param_index=_build_param_type_index(tools),
+            param_index=param_index,
         )
     else:
-        content_text = _decode(tokenizer, ids).strip()
+        # vLLM ``qwen3coder_tool_parser.py:269-271`` back-off: if no
+        # ``<tool_call>`` markers are present, treat the whole output
+        # as a single synthetic tool-call region and scan for raw
+        # ``<function=…>`` blocks. The content text is whatever sits
+        # outside any recovered function block (typically empty).
+        full_text = _decode(tokenizer, ids)
+        tool_calls = _parse_xml_function_blocks(
+            full_text,
+            param_index=param_index,
+            token_span=(parse_offset, parse_offset + len(ids)),
+            wrapper_unclosed=False,
+        )
+        if tool_calls:
+            content_text = _strip_function_blocks(full_text).strip()
+        else:
+            content_text = full_text.strip()
 
     return ParsedResponse(
         content=content_text,
@@ -382,69 +429,148 @@ def _parse_xml_tool_calls(
     section_offset: int,
     param_index: dict[str, dict[str, dict[str, Any]]],
 ) -> list[ParsedToolCall]:
-    """Parse Qwen3.5-style XML tool calls from token IDs."""
-    import re
+    """Parse Qwen3.5-style XML tool calls from token IDs.
 
+    Uses token IDs to demarcate ``<tool_call>`` / ``</tool_call>``
+    boundaries (so ``token_span`` stays precise for trainer-side
+    masking) and vLLM-parity regex on the decoded block text to
+    extract the function/parameter content tolerantly. Mirrors
+    ``Qwen3CoderToolParser._parse_xml_function_call`` plus the
+    tag-tolerance branches of the three module-level patterns.
+    """
     tool_calls: list[ParsedToolCall] = []
     i = 0
     while i < len(ids):
-        if ids[i] == tc_id:
-            end = _find(ids, tc_end_id, i + 1)
-            if end == -1:
-                raw = _decode(tokenizer, ids[i + 1 :])
-                tool_calls.append(
-                    ParsedToolCall(
-                        raw=raw,
-                        token_span=(section_offset + i, section_offset + len(ids)),
-                        status=ToolCallParseStatus.UNCLOSED_BLOCK,
-                    )
-                )
-                break
+        if ids[i] != tc_id:
+            i += 1
+            continue
+
+        end = _find(ids, tc_end_id, i + 1)
+        if end == -1:
+            block_ids = ids[i + 1 :]
+            block_text = _decode(tokenizer, block_ids)
+            span = (section_offset + i, section_offset + len(ids))
+            wrapper_unclosed = True
+        else:
             block_text = _decode(tokenizer, ids[i + 1 : end])
             span = (section_offset + i, section_offset + end + 1)
-            name_match = re.search(r"<function=([^>]+)>", block_text)
-            if not name_match:
-                tool_calls.append(
-                    ParsedToolCall(
-                        raw=block_text,
-                        token_span=span,
-                        status=ToolCallParseStatus.MALFORMED_STRUCTURE,
-                    )
-                )
-                i = end + 1
-                continue
+            wrapper_unclosed = False
 
-            name = name_match.group(1)
-            params = param_index.get(name, {})
-            arguments: dict = {}
-            any_json_fallback = False
-            for pm in re.finditer(
-                r"<parameter=([^>]+)>\n?(.*?)\n?</parameter>", block_text, re.DOTALL
-            ):
-                arg_name = pm.group(1)
-                arg_value = pm.group(2).strip()
-                value, used_fallback = _coerce_arg_value(
-                    arg_value, params.get(arg_name)
-                )
-                arguments[arg_name] = value
-                any_json_fallback = any_json_fallback or used_fallback
+        block_calls = _parse_xml_function_blocks(
+            block_text,
+            param_index=param_index,
+            token_span=span,
+            wrapper_unclosed=wrapper_unclosed,
+        )
+        if block_calls:
+            tool_calls.extend(block_calls)
+        elif wrapper_unclosed:
+            # vLLM would silently drop a content-less unclosed
+            # ``<tool_call>``; we keep the diagnostic so verifier /
+            # RL-loss code can mask the malformed span.
             tool_calls.append(
                 ParsedToolCall(
                     raw=block_text,
-                    name=name,
-                    arguments=arguments,
                     token_span=span,
-                    status=(
-                        ToolCallParseStatus.INVALID_JSON
-                        if any_json_fallback
-                        else ToolCallParseStatus.OK
-                    ),
+                    status=ToolCallParseStatus.UNCLOSED_BLOCK,
                 )
             )
-            i = end + 1
         else:
-            i += 1
+            tool_calls.append(
+                ParsedToolCall(
+                    raw=block_text,
+                    token_span=span,
+                    status=ToolCallParseStatus.MALFORMED_STRUCTURE,
+                )
+            )
+
+        if wrapper_unclosed:
+            break
+        i = end + 1
     return tool_calls
+
+
+def _parse_xml_function_blocks(
+    text: str,
+    *,
+    param_index: dict[str, dict[str, dict[str, Any]]],
+    token_span: tuple[int, int] | None,
+    wrapper_unclosed: bool,
+) -> list[ParsedToolCall]:
+    """Apply vLLM's ``<function=…></function>`` regex over *text*.
+
+    ``token_span`` is shared by every call recovered from this block;
+    the granularity is the surrounding ``<tool_call>`` region (or the
+    whole completion in the no-marker back-off path), matching how
+    vLLM treats multiple ``<function=>`` siblings — it does not try to
+    attribute character offsets back to token positions.
+    """
+    tool_calls: list[ParsedToolCall] = []
+    for match in _FUNCTION_BLOCK_RE.finditer(text):
+        closed = match.group(1)
+        body = closed if closed is not None else (match.group(2) or "")
+        function_unclosed = closed is None
+        end_index = body.find(">")
+        if end_index == -1:
+            tool_calls.append(
+                ParsedToolCall(
+                    raw=body,
+                    token_span=token_span,
+                    status=ToolCallParseStatus.MALFORMED_STRUCTURE,
+                )
+            )
+            continue
+
+        name = body[:end_index]
+        params_text = body[end_index + 1 :]
+        params = param_index.get(name, {})
+        arguments: dict = {}
+        any_fallback = False
+        for capture in _PARAMETER_BLOCK_RE.findall(params_text):
+            idx = capture.find(">")
+            if idx == -1:
+                continue
+            arg_name = capture[:idx]
+            arg_value = _strip_one_newline(capture[idx + 1 :])
+            value, used_fallback = _coerce_arg_value(arg_value, params.get(arg_name))
+            arguments[arg_name] = value
+            any_fallback = any_fallback or used_fallback
+
+        if wrapper_unclosed or function_unclosed:
+            status = ToolCallParseStatus.UNCLOSED_BLOCK
+        elif any_fallback:
+            status = ToolCallParseStatus.INVALID_JSON
+        else:
+            status = ToolCallParseStatus.OK
+        tool_calls.append(
+            ParsedToolCall(
+                raw=body,
+                name=name,
+                arguments=arguments,
+                token_span=token_span,
+                status=status,
+            )
+        )
+    return tool_calls
+
+
+def _strip_function_blocks(text: str) -> str:
+    """Remove every ``<function=…></function>`` (closed or unclosed)
+    region from *text* so the leftover is whatever the model emitted
+    as natural-language content alongside an un-bracketed tool call.
+    """
+    return _FUNCTION_BLOCK_RE.sub("", text)
+
+
+def _strip_one_newline(s: str) -> str:
+    """vLLM ``qwen3coder_tool_parser.py:246-250`` strips exactly one
+    leading and one trailing newline from a parameter value — no
+    further whitespace trimming."""
+    if s.startswith("\n"):
+        s = s[1:]
+    if s.endswith("\n"):
+        s = s[:-1]
+    return s
 
 
 # ── GLM-5/4.7/4.5: <tool_call> name <arg_key>k</arg_key> <arg_value>v</arg_value> </tool_call>
