@@ -67,9 +67,21 @@ PROMPT = [
 ]
 
 
+# Renderers whose wire format quotes strings (Hermes JSON, section
+# JSON). Those parsers preserve the string ``"null"`` verbatim because
+# the wire bytes are unambiguous. XML-style renderers can't tell the
+# string ``null`` from a JSON null on the wire, so they null-coerce —
+# matching vLLM's ``Qwen3CoderToolParser._convert_param_value:125``
+# which runs the null short-circuit before any type check.
+_JSON_FORMAT_MODELS = {"Qwen/Qwen3-8B", "moonshotai/Kimi-K2-Instruct"}
+
+
 # Each case: a single ``x`` argument whose value is a STRING that
 # happens to be valid JSON of another type. With a schema declaring
-# ``x: string``, the parser must return the string verbatim.
+# ``x: string``, the parser must return the string verbatim — except
+# for the ``string-null`` case on XML renderers, where vLLM's
+# ``null`` short-circuit runs before the type check and we follow
+# suit for byte parity (see test below for the explicit assertion).
 JSON_LOOKING_STRING_ARGS = [
     pytest.param({"x": "true"}, id="string-bool"),
     pytest.param({"x": "42"}, id="string-int"),
@@ -116,9 +128,16 @@ def _extract_assistant_tokens(renderer, prompt, assistant_msg, *, tools=None):
 
 
 @pytest.mark.parametrize("args", JSON_LOOKING_STRING_ARGS)
-def test_string_arg_preserves_type(model, renderer_name, renderer, args):
+def test_string_arg_preserves_type(model, renderer_name, renderer, args, request):
     """Tool-call args of declared type ``str`` must round-trip as ``str``,
-    not get re-parsed as bool/int/null/list/dict by the parser."""
+    not get re-parsed as bool/int/null/list/dict by the parser.
+
+    Exception: the ``string-null`` case on XML renderers collapses to
+    Python ``None`` to match vLLM's null short-circuit. The XML wire
+    format is genuinely ambiguous there (``<parameter=x>null</parameter>``
+    is identical bytes whether the model meant the string ``"null"``
+    or a JSON null), and vLLM resolves the ambiguity by null-coercing.
+    """
     msg = {
         "role": "assistant",
         "content": "",
@@ -134,6 +153,12 @@ def test_string_arg_preserves_type(model, renderer_name, renderer, args):
 
     assert parsed.tool_calls, f"{model}: parser returned no tool_calls"
     got = _normalize_args(parsed.tool_calls[0].arguments)
-    assert got == args, (
+
+    case_id = request.node.callspec.id.rsplit("-", 1)[-1]
+    if case_id == "null" and model not in _JSON_FORMAT_MODELS:
+        expected = {"x": None}
+    else:
+        expected = args
+    assert got == expected, (
         f"{model}: tool-arg type drift — sent {args!r}, parser returned {got!r}"
     )

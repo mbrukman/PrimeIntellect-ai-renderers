@@ -63,15 +63,16 @@ def test_null_literal_is_case_insensitive_for_non_string_types(declared):
         assert used_fallback is False
 
 
-def test_null_is_preserved_verbatim_for_string_type():
-    """Deliberate deviation from vLLM/SGLang: string-typed ``"null"``
-    stays as the string ``"null"`` so the existing string-verbatim
-    contract holds (see ``test_tool_arg_type_preservation``). The XML
-    wire format already can't distinguish the string ``"null"`` from
-    JSON null, but when a schema says ``type: "string"`` we honour it."""
-    value, used_fallback = _coerce_arg_value("null", {"type": "string"})
-    assert value == "null"
-    assert used_fallback is False
+def test_null_short_circuit_applies_even_for_string_type():
+    """vLLM ``qwen3coder_tool_parser.py:125`` null-coerces ``"null"``
+    *before* the type check, so a string-typed wire value of ``null``
+    collapses to Python ``None``. The XML wire format can't tell the
+    string ``"null"`` from JSON null; we accept the lossy round-trip
+    in exchange for byte parity with vLLM."""
+    for raw in ("null", "Null", "NULL"):
+        value, used_fallback = _coerce_arg_value(raw, {"type": "string"})
+        assert value is None
+        assert used_fallback is False
 
 
 @pytest.mark.parametrize(

@@ -160,21 +160,21 @@ def _coerce_arg_value(
     text for objects), so the caller can flag ``INVALID_JSON``.
 
     The ladder mirrors vLLM's ``Qwen3CoderToolParser._convert_param_value``
-    and SGLang's ``Qwen3CoderDetector._convert_param_value`` with one
-    deliberate deviation noted inline:
+    and SGLang's ``Qwen3CoderDetector._convert_param_value`` byte-for-byte:
 
-    - ``null`` short-circuit (any case) → ``None`` for any declared
-      type **except** the string family (see deviation below).
-    - No schema OR param not in schema → return verbatim (after the
-      null short-circuit). vLLM ``qwen3coder_tool_parser.py:128-137``:
+    - ``null`` short-circuit (any case) → ``None``. Runs **before** any
+      type check, including the string family. vLLM does this on line
+      125 of ``qwen3coder_tool_parser.py`` ahead of the
+      ``param_name not in param_config`` branch. This means a
+      string-typed arg whose wire value is the literal ``null``
+      collapses to Python ``None`` — the XML wire format can't
+      distinguish that case from a JSON null, and we accept the
+      lossy round-trip in exchange for byte parity with vLLM.
+    - No schema OR param not in schema → return verbatim. vLLM
+      ``qwen3coder_tool_parser.py:128-137``:
       ``if param_name not in param_config: return param_value``.
     - ``string`` / ``str`` / ``text`` / ``varchar`` / ``char`` / ``enum``
-      → return verbatim. (Deviation: vLLM/SGLang null-coerce ``"null"``
-      *before* checking type, so a string-typed arg of ``"null"`` would
-      come back as Python ``None``. Renderers preserves the string
-      because the XML wire format can't distinguish the string
-      ``"null"`` from JSON null, and downstream tests pin the
-      preservation contract; see ``test_tool_arg_type_preservation``.)
+      → return verbatim.
     - ``int`` / ``uint`` / ``long`` / ``short`` / ``unsigned`` family →
       ``int(text)``, degenerating to raw text + INVALID.
     - ``num`` / ``float`` family → ``float(text)`` with int demotion
@@ -190,13 +190,10 @@ def _coerce_arg_value(
     - Any other declared type → ``ast.literal_eval`` if it parses, else
       raw text. Matches vLLM's catch-all else branch.
     """
-    declared = _declared_type(param_schema)
-
-    # vLLM null short-circuit runs BEFORE the schema-missing check, but
-    # is suppressed for declared string types so the wire-format
-    # ambiguity is resolved in favour of the explicit schema.
-    if declared not in _STRING_TYPES and text.lower() == "null":
+    if text.lower() == "null":
         return None, False
+
+    declared = _declared_type(param_schema)
 
     if param_schema is None or declared is None or declared in _STRING_TYPES:
         return text, False
