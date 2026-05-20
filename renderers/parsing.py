@@ -19,6 +19,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import uuid
 from typing import Any
 
 from renderers.base import ParsedResponse, ParsedToolCall, ToolCallParseStatus, ToolSpec
@@ -34,6 +35,25 @@ from renderers.base import ParsedResponse, ParsedToolCall, ToolCallParseStatus, 
 # positive lookaheads so a missing ``</parameter>`` is recovered from
 # the next ``<parameter=`` / ``</function>`` boundary instead of
 # silently dropping the value.
+
+
+# Mask matching vLLM's ``vllm.utils.MASK_64_BITS`` so the random id we
+# generate is byte-shape compatible with vLLM's ``random_uuid()``.
+_MASK_64_BITS = (1 << 64) - 1
+
+
+def _make_tool_call_id() -> str:
+    """Mint a tool-call id in vLLM's default format.
+
+    vLLM's ``ToolCall`` dataclass uses ``default_factory=make_tool_call_id``
+    which returns ``f"chatcmpl-tool-{random_uuid()}"`` where
+    ``random_uuid`` is ``f"{uuid.uuid4().int & MASK_64_BITS:016x}"`` —
+    16 hex characters drawn from the low 64 bits of a v4 UUID. We
+    reproduce the format so OpenAI-shaped clients get the same id
+    surface across renderers and vLLM serving paths.
+    """
+    return f"chatcmpl-tool-{uuid.uuid4().int & _MASK_64_BITS:016x}"
+
 
 _TOOL_CALL_BLOCK_RE = re.compile(
     r"<tool_call>(.*?)</tool_call>|<tool_call>(.*?)$", re.DOTALL
@@ -382,36 +402,49 @@ def parse_qwen35(
             content="", reasoning_content=reasoning or None, tool_calls=[]
         )
 
+    full_text = _decode(tokenizer, ids)
     tc_start = _find(ids, tool_call_id)
-    tool_calls: list[ParsedToolCall] = []
     param_index = _build_param_type_index(tools)
-    if tc_start != -1:
-        content_text = _decode(tokenizer, ids[:tc_start]).strip()
-        tool_calls = _parse_xml_tool_calls(
-            tokenizer,
-            ids[tc_start:],
-            tool_call_id,
-            tool_call_end_id,
-            section_offset=parse_offset + tc_start,
-            param_index=param_index,
-        )
-    else:
-        # vLLM ``qwen3coder_tool_parser.py:269-271`` back-off: if no
-        # ``<tool_call>`` markers are present, treat the whole output
-        # as a single synthetic tool-call region and scan for raw
-        # ``<function=…>`` blocks. The content text is whatever sits
-        # outside any recovered function block (typically empty).
-        full_text = _decode(tokenizer, ids)
-        tool_calls = _parse_xml_function_blocks(
-            full_text,
-            param_index=param_index,
-            token_span=(parse_offset, parse_offset + len(ids)),
-            wrapper_unclosed=False,
-        )
-        if tool_calls:
-            content_text = _strip_function_blocks(full_text).strip()
+    try:
+        if tc_start != -1:
+            # vLLM ``qwen3coder_tool_parser.py:316-319``: content text
+            # is the raw slice up to the first ``<tool_call>`` (or
+            # first ``<function=`` if no ``<tool_call>`` is present).
+            # No whitespace stripping — the model's prefix prose is
+            # surfaced verbatim.
+            content_text = _decode(tokenizer, ids[:tc_start])
+            tool_calls = _parse_xml_tool_calls(
+                tokenizer,
+                ids[tc_start:],
+                tool_call_id,
+                tool_call_end_id,
+                section_offset=parse_offset + tc_start,
+                param_index=param_index,
+            )
         else:
-            content_text = full_text.strip()
+            # vLLM ``qwen3coder_tool_parser.py:269-271`` back-off: no
+            # ``<tool_call>`` markers — scan whole output for raw
+            # ``<function=…>`` blocks. Content text is whatever sits
+            # before the first ``<function=`` (vLLM line 317-319), or
+            # the full text if nothing matches.
+            tool_calls = _parse_xml_function_blocks(
+                full_text,
+                param_index=param_index,
+                token_span=(parse_offset, parse_offset + len(ids)),
+                wrapper_unclosed=False,
+            )
+            if tool_calls:
+                first_fn = full_text.find("<function=")
+                content_text = full_text[:first_fn] if first_fn >= 0 else full_text
+            else:
+                content_text = full_text
+    except Exception:
+        # vLLM ``qwen3coder_tool_parser.py:327-331`` catch-all: on any
+        # extraction error, drop every recovered call and surface the
+        # raw text as content so downstream consumers never see a
+        # half-parsed call.
+        content_text = full_text
+        tool_calls = []
 
     return ParsedResponse(
         content=content_text,
@@ -547,19 +580,12 @@ def _parse_xml_function_blocks(
                 raw=body,
                 name=name,
                 arguments=arguments,
+                id=_make_tool_call_id(),
                 token_span=token_span,
                 status=status,
             )
         )
     return tool_calls
-
-
-def _strip_function_blocks(text: str) -> str:
-    """Remove every ``<function=…></function>`` (closed or unclosed)
-    region from *text* so the leftover is whatever the model emitted
-    as natural-language content alongside an un-bracketed tool call.
-    """
-    return _FUNCTION_BLOCK_RE.sub("", text)
 
 
 def _strip_one_newline(s: str) -> str:

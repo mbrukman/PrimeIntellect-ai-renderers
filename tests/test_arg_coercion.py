@@ -329,7 +329,9 @@ def test_qwen35_tolerates_unclosed_function():
 def test_qwen35_backoff_no_tool_call_markers():
     """vLLM ``qwen3coder_tool_parser.py:269-271``: when the output
     contains no ``<tool_call>`` markers, treat the whole completion as
-    a single tool-call region and scan for ``<function=…>`` directly."""
+    a single tool-call region and scan for ``<function=…>`` directly.
+    Content text is the raw slice up to the first ``<function=``,
+    matching ``qwen3coder_tool_parser.py:316-319`` (no strip)."""
     tok = load_tokenizer("Qwen/Qwen3.5-9B")
     parsed = _parse(
         tok,
@@ -345,16 +347,104 @@ def test_qwen35_backoff_no_tool_call_markers():
     assert tc.status == ToolCallParseStatus.OK
     assert tc.name == "filesystem_server_get_directory_tree"
     assert tc.arguments == {"path": "/etc", "max_depth": 1}
-    assert "sure, calling now" in parsed.content
+    # vLLM-parity: content = text up to first ``<function=``, no strip.
+    assert parsed.content == "sure, calling now.\n"
 
 
 def test_qwen35_backoff_returns_no_calls_when_no_function_either():
     """No ``<tool_call>`` and no ``<function=`` → no recovered calls,
-    full text returned as content."""
+    full text returned as content verbatim (no strip, vLLM parity)."""
     tok = load_tokenizer("Qwen/Qwen3.5-9B")
     parsed = _parse(tok, "just a chat reply", tools=_TOOLS_FROM_ISSUE)
     assert parsed.tool_calls == []
     assert parsed.content == "just a chat reply"
+
+
+def test_qwen35_content_text_not_stripped():
+    """vLLM ``qwen3coder_tool_parser.py:316-319`` slices raw text before
+    the first ``<tool_call>``; the commented-out ``.rstrip()`` confirms
+    intent. We mirror that — surrounding whitespace round-trips."""
+    tok = load_tokenizer("Qwen/Qwen3.5-9B")
+    parsed = _parse(
+        tok,
+        "let me check\n\n"  # trailing whitespace before <tool_call>
+        "<tool_call>\n"
+        "<function=filesystem_server_get_directory_tree>\n"
+        "<parameter=path>/</parameter>\n"
+        "</function>\n"
+        "</tool_call>",
+        tools=_TOOLS_FROM_ISSUE,
+    )
+    assert parsed.content == "let me check\n\n"
+    assert len(parsed.tool_calls) == 1
+    assert parsed.tool_calls[0].status == ToolCallParseStatus.OK
+
+
+def test_qwen35_tool_call_id_matches_vllm_format():
+    """vLLM's ``ToolCall`` default factory mints ids of the form
+    ``chatcmpl-tool-<16 hex>``. Each surfaced call gets a fresh id."""
+    import re as _re
+
+    tok = load_tokenizer("Qwen/Qwen3.5-9B")
+    parsed = _parse(
+        tok,
+        "<tool_call>\n"
+        "<function=filesystem_server_get_directory_tree>\n"
+        "<parameter=path>/</parameter>\n"
+        "</function>\n"
+        "</tool_call>\n"
+        "<tool_call>\n"
+        "<function=filesystem_server_get_directory_tree>\n"
+        "<parameter=path>/etc</parameter>\n"
+        "</function>\n"
+        "</tool_call>",
+        tools=_TOOLS_FROM_ISSUE,
+    )
+    assert len(parsed.tool_calls) == 2
+    pattern = _re.compile(r"^chatcmpl-tool-[0-9a-f]{16}$")
+    ids = [tc.id for tc in parsed.tool_calls]
+    for tcid in ids:
+        assert tcid is not None and pattern.match(tcid), tcid
+    # Two surfaced calls must get distinct ids.
+    assert ids[0] != ids[1]
+
+
+def test_qwen35_exception_fallback_returns_full_text():
+    """vLLM ``qwen3coder_tool_parser.py:327-331`` catch-all returns
+    ``tools_called=False, tool_calls=[], content=model_output`` on any
+    unhandled extraction error. We mirror that by wrapping the
+    tool-call extraction; reasoning content extracted earlier is kept.
+    """
+    from unittest.mock import patch
+
+    tok = load_tokenizer("Qwen/Qwen3.5-9B")
+    completion = (
+        "<tool_call>\n"
+        "<function=filesystem_server_get_directory_tree>\n"
+        "<parameter=path>/</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+    ids = tok.encode(completion, add_special_tokens=False)
+
+    with patch(
+        "renderers.parsing._parse_xml_tool_calls",
+        side_effect=RuntimeError("boom"),
+    ):
+        parsed = parse_qwen35(
+            tok,
+            list(ids),
+            stop_ids={tok.eos_token_id} if tok.eos_token_id is not None else set(),
+            think_id=tok.convert_tokens_to_ids("<think>"),
+            think_end_id=tok.convert_tokens_to_ids("</think>"),
+            tool_call_id=tok.convert_tokens_to_ids("<tool_call>"),
+            tool_call_end_id=tok.convert_tokens_to_ids("</tool_call>"),
+            tools=_TOOLS_FROM_ISSUE,
+        )
+    assert parsed.tool_calls == []
+    # content is the full decoded post-think text, surfaced verbatim.
+    assert "<tool_call>" in parsed.content
+    assert "<function=filesystem_server_get_directory_tree>" in parsed.content
 
 
 def test_qwen35_parameter_value_preserves_internal_whitespace():
