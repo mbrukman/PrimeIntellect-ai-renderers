@@ -45,6 +45,10 @@ tag-pattern = '^renderers-v(?P<version>.+)$'
 # only fires when the resolver has nothing to go on.
 fallback-version = "0.0.0"
 
+[tool.hatch.version.raw-options]
+# Dev release tags cannot be advanced by the default guess-next-dev scheme.
+version_scheme = "semver-pep440"
+
 [tool.hatch.build.hooks.vcs]
 # Write the resolved version to a Python file so it can be inspected
 # at runtime via ``renderers.__version__`` without re-parsing the
