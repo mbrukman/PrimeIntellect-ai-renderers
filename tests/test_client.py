@@ -502,3 +502,72 @@ def test_generate_caches_max_prompt_len_lookup_failure():
     assert len(client.calls) == 1
     assert result["prompt_ids"] == list(range(10))
     assert _max_prompt_len_cache[("http://no-models:8000/v1", "test-model")] is None
+
+
+def test_generate_uses_env_max_prompt_len_override(monkeypatch):
+    """``RENDERERS_MAX_PROMPT_LEN`` overrides auto-discovery entirely: the
+    pre-flight uses the env value and ``/v1/models`` is never queried,
+    even when the engine would have returned a different cap."""
+    from renderers.client import OverlongPromptError, _max_prompt_len_cache
+
+    class _ClientWithModels(_FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.base_url = "http://disco-host:8000/v1"
+            self.models_calls = 0
+
+        async def get(self, path, *, cast_to):
+            self.models_calls += 1
+            return {"object": "list", "data": [{"id": "test-model", "max_model_len": 999}]}
+
+    _max_prompt_len_cache.clear()
+    monkeypatch.setenv("RENDERERS_MAX_PROMPT_LEN", "4")
+
+    client = _ClientWithModels()
+    with pytest.raises(OverlongPromptError) as excinfo:
+        asyncio.run(
+            generate(
+                client=client,
+                renderer=_LongRenderer(),
+                messages=[{"role": "user", "content": "hi"}],
+                model="test-model",
+            )
+        )
+
+    assert excinfo.value.max_prompt_len == 4, "env override beats engine card"
+    assert excinfo.value.prompt_len == 10
+    assert client.models_calls == 0, "env override must skip /v1/models query"
+    assert client.calls == [], "request must not be dispatched on pre-flight fail"
+
+
+def test_generate_env_override_invalid_falls_back_to_auto_discovery(monkeypatch):
+    """A non-integer or non-positive ``RENDERERS_MAX_PROMPT_LEN`` is ignored
+    (with a warning) and auto-discovery proceeds normally."""
+    from renderers.client import OverlongPromptError, _max_prompt_len_cache
+
+    class _ClientWithModels(_FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.base_url = "http://disco-host-2:8000/v1"
+            self.models_calls = 0
+
+        async def get(self, path, *, cast_to):
+            self.models_calls += 1
+            return {"object": "list", "data": [{"id": "test-model", "max_model_len": 4}]}
+
+    _max_prompt_len_cache.clear()
+    monkeypatch.setenv("RENDERERS_MAX_PROMPT_LEN", "not-an-int")
+
+    client = _ClientWithModels()
+    with pytest.raises(OverlongPromptError) as excinfo:
+        asyncio.run(
+            generate(
+                client=client,
+                renderer=_LongRenderer(),
+                messages=[{"role": "user", "content": "hi"}],
+                model="test-model",
+            )
+        )
+
+    assert excinfo.value.max_prompt_len == 4, "auto-discovered cap should win"
+    assert client.models_calls == 1, "invalid env override must not skip /v1/models"

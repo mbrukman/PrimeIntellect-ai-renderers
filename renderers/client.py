@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from collections.abc import Mapping
 from typing import Any, cast
 
@@ -66,6 +67,38 @@ _max_prompt_len_cache: dict[tuple[str, str], int | None] = {}
 _max_prompt_len_lock = asyncio.Lock()
 
 
+_MAX_PROMPT_LEN_ENV_VAR = "RENDERERS_MAX_PROMPT_LEN"
+
+
+def _max_prompt_len_from_env() -> int | None:
+    """Read the ``RENDERERS_MAX_PROMPT_LEN`` env-var override.
+
+    Returns the parsed positive int, or ``None`` if unset/invalid. When
+    set, ``_resolve_max_prompt_len`` returns this value without querying
+    the engine — useful when the engine's ``/v1/models`` endpoint is
+    broken (e.g., a misconfigured router) but the operator knows the
+    real ``max_model_len``.
+    """
+    raw = os.environ.get(_MAX_PROMPT_LEN_ENV_VAR)
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        _request_logger.warning(
+            "%s is set to %r, which is not a valid integer; ignoring.",
+            _MAX_PROMPT_LEN_ENV_VAR,
+            raw,
+        )
+        return None
+    if value <= 0:
+        _request_logger.warning(
+            "%s=%d is not positive; ignoring.", _MAX_PROMPT_LEN_ENV_VAR, value
+        )
+        return None
+    return value
+
+
 async def _resolve_max_prompt_len(client: AsyncOpenAI, model: str) -> int | None:
     """Discover ``max_model_len`` from the engine via ``GET /v1/models``.
 
@@ -80,7 +113,16 @@ async def _resolve_max_prompt_len(client: AsyncOpenAI, model: str) -> int | None
     Any exception during lookup (network error, non-JSON body, attribute
     miss on a mock client in tests) is treated as "unknown cap": cached
     ``None`` so we don't retry on every call.
+
+    The ``RENDERERS_MAX_PROMPT_LEN`` env var overrides auto-discovery
+    entirely: when set to a positive integer, that value is returned and
+    no ``/v1/models`` request is issued. Use this when the engine's model
+    card is unreachable (e.g., a router whose ``/v1/models`` handler is
+    broken) but the operator knows the engine's real cap.
     """
+    override = _max_prompt_len_from_env()
+    if override is not None:
+        return override
     key = (str(getattr(client, "base_url", "")), model)
     if key in _max_prompt_len_cache:
         return _max_prompt_len_cache[key]
