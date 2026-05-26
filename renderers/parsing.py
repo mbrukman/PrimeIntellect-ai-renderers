@@ -54,9 +54,6 @@ def _make_tool_call_id() -> str:
     return f"chatcmpl-tool-{uuid.uuid4().int & _MASK_64_BITS:016x}"
 
 
-_TOOL_CALL_BLOCK_RE = re.compile(
-    r"<tool_call>(.*?)</tool_call>|<tool_call>(.*?)$", re.DOTALL
-)
 _FUNCTION_BLOCK_RE = re.compile(
     r"<function=(.*?)</function>|<function=(.*)$", re.DOTALL
 )
@@ -255,11 +252,16 @@ def _coerce_arg_value(
             except (ValueError, TypeError):
                 continue
         if candidate == "number":
+            # ``int(val)`` is inside the try block so ``nan`` (raises
+            # ``ValueError``) and ``inf`` (raises ``OverflowError``) skip
+            # the number branch instead of aborting the whole parse.
+            # vLLM's reference catches ``ValueError`` / ``TypeError`` only
+            # — we widen to ``OverflowError`` so ``"inf"`` doesn't crash.
             try:
                 val = float(text)
-            except (ValueError, TypeError):
+                return (val if val != int(val) else int(val)), False
+            except (ValueError, TypeError, OverflowError):
                 continue
-            return (val if val != int(val) else int(val)), False
         if candidate == "boolean":
             lowered = text.lower().strip()
             if lowered in ("true", "1"):
@@ -608,6 +610,12 @@ def _parse_xml_function_blocks(
             arguments[arg_name] = value
             any_fallback = any_fallback or used_fallback
 
+        # Precedence: structural failure dominates coercion failure.
+        # When a block is both unclosed AND has args that couldn't be
+        # coerced, surface ``UNCLOSED_BLOCK`` only — the truncation is
+        # the root cause and the verifier already discounts unclosed
+        # blocks. ``INVALID_JSON`` is reserved for well-formed blocks
+        # whose recovered args couldn't satisfy the schema.
         if wrapper_unclosed or function_unclosed:
             status = ToolCallParseStatus.UNCLOSED_BLOCK
         elif any_fallback:
