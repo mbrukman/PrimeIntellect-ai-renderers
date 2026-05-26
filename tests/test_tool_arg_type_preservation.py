@@ -40,11 +40,11 @@ _MODELS = [
 
 @lru_cache(maxsize=None)
 def _load(model: str, renderer_name: str):
-    from renderers import create_renderer
+    from renderers import config_from_name, create_renderer
     from renderers.base import load_tokenizer
 
     tok = load_tokenizer(model)
-    return tok, create_renderer(tok, renderer=renderer_name)
+    return tok, create_renderer(tok, config_from_name(renderer_name))
 
 
 def pytest_generate_tests(metafunc):
@@ -67,21 +67,14 @@ PROMPT = [
 ]
 
 
-# Renderers whose wire format quotes strings (Hermes JSON, section
-# JSON). Those parsers preserve the string ``"null"`` verbatim because
-# the wire bytes are unambiguous. XML-style renderers can't tell the
-# string ``null`` from a JSON null on the wire, so they null-coerce —
-# matching vLLM's ``Qwen3CoderToolParser._convert_param_value:125``
-# which runs the null short-circuit before any type check.
-_JSON_FORMAT_MODELS = {"Qwen/Qwen3-8B", "moonshotai/Kimi-K2-Instruct"}
-
-
 # Each case: a single ``x`` argument whose value is a STRING that
 # happens to be valid JSON of another type. With a schema declaring
-# ``x: string``, the parser must return the string verbatim — except
-# for the ``string-null`` case on XML renderers, where vLLM's
-# ``null`` short-circuit runs before the type check and we follow
-# suit for byte parity (see test below for the explicit assertion).
+# ``x: string``, the parser must return the string verbatim across all
+# renderers — including the ``string-null`` case, which now rides
+# vLLM's priority-ordered ladder where ``string`` is the always-
+# succeeding terminal and ``null`` is only coerced when ``"null"`` is
+# in the type set (``Optional[str]`` declares it; pure ``str`` does
+# not). See ``vllm/tool_parsers/utils.py:coerce_to_schema_type``.
 JSON_LOOKING_STRING_ARGS = [
     pytest.param({"x": "true"}, id="string-bool"),
     pytest.param({"x": "42"}, id="string-int"),
@@ -128,15 +121,17 @@ def _extract_assistant_tokens(renderer, prompt, assistant_msg, *, tools=None):
 
 
 @pytest.mark.parametrize("args", JSON_LOOKING_STRING_ARGS)
-def test_string_arg_preserves_type(model, renderer_name, renderer, args, request):
+def test_string_arg_preserves_type(model, renderer_name, renderer, args):
     """Tool-call args of declared type ``str`` must round-trip as ``str``,
     not get re-parsed as bool/int/null/list/dict by the parser.
 
-    Exception: the ``string-null`` case on XML renderers collapses to
-    Python ``None`` to match vLLM's null short-circuit. The XML wire
-    format is genuinely ambiguous there (``<parameter=x>null</parameter>``
-    is identical bytes whether the model meant the string ``"null"``
-    or a JSON null), and vLLM resolves the ambiguity by null-coercing.
+    Under vLLM ``coerce_to_schema_type`` parity, a string-typed param
+    whose wire bytes happen to spell ``null`` stays a string — null
+    coercion only fires when ``"null"`` is declared in the schema
+    (typically via ``Optional[X]`` ⇒ ``anyOf [X, null]`` or
+    ``type: ["X", "null"]``). The string branch is the always-
+    succeeding terminal of the priority ladder, so it absorbs every
+    bare wire value without flagging.
     """
     msg = {
         "role": "assistant",
@@ -154,11 +149,78 @@ def test_string_arg_preserves_type(model, renderer_name, renderer, args, request
     assert parsed.tool_calls, f"{model}: parser returned no tool_calls"
     got = _normalize_args(parsed.tool_calls[0].arguments)
 
-    case_id = request.node.callspec.id.rsplit("-", 1)[-1]
-    if case_id == "null" and model not in _JSON_FORMAT_MODELS:
-        expected = {"x": None}
-    else:
-        expected = args
-    assert got == expected, (
+    assert got == args, (
         f"{model}: tool-arg type drift — sent {args!r}, parser returned {got!r}"
+    )
+
+
+# Schemas where ``string`` is one branch of a union (``anyOf`` / ``oneOf``).
+# These are common in practice — e.g. ``form_input.value: str | bool`` in
+# Pydantic serialises to ``{"anyOf": [{"type": "string"}, {"type": "boolean"}]}``.
+# Without the union-aware check, the XML parser's ``json.loads`` falls back
+# to raw text for bare strings, but flags the call ``INVALID_JSON`` because
+# no top-level ``type`` key declared a string — silently dropping otherwise
+# valid tool calls in the renderer client.
+UNION_WITH_STRING_SCHEMAS = [
+    pytest.param(
+        {"anyOf": [{"type": "string"}, {"type": "boolean"}]},
+        id="anyOf-string-boolean",
+    ),
+    pytest.param(
+        {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        id="anyOf-string-null",
+    ),
+    pytest.param(
+        {"oneOf": [{"type": "string"}, {"type": "integer"}]},
+        id="oneOf-string-integer",
+    ),
+]
+
+
+@pytest.mark.parametrize("param_schema", UNION_WITH_STRING_SCHEMAS)
+def test_union_with_string_emits_ok_status(
+    model, renderer_name, renderer, param_schema
+):
+    """Union schemas containing ``string`` must yield ``status=OK`` when
+    the model emits a bare string. Pre-fix, ``_coerce_arg_value`` flagged
+    this as ``INVALID_JSON`` because the top-level ``type`` key was
+    absent (the string branch was under ``anyOf`` / ``oneOf``)."""
+    from renderers.base import ToolCallParseStatus
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "f",
+                "description": "Test tool with one union-typed parameter.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"x": param_schema},
+                    "required": ["x"],
+                },
+            },
+        }
+    ]
+    args = {"x": "abc"}
+    msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "functions.f:0",
+                "function": {"name": "f", "arguments": args},
+            }
+        ],
+    }
+    completion_ids = _extract_assistant_tokens(renderer, PROMPT, msg, tools=tools)
+    parsed = renderer.parse_response(completion_ids, tools=tools)
+
+    assert parsed.tool_calls, f"{model}: parser returned no tool_calls"
+    tc = parsed.tool_calls[0]
+    assert tc.status == ToolCallParseStatus.OK, (
+        f"{model}: union-with-string schema flagged {tc.status} on bare string"
+    )
+    got = _normalize_args(tc.arguments)
+    assert got == args, (
+        f"{model}: tool-arg drift — sent {args!r}, parser returned {got!r}"
     )

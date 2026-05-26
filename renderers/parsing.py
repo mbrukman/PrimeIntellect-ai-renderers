@@ -16,7 +16,6 @@ failure) — see ``ToolCallParseStatus`` docstring for the rationale.
 
 from __future__ import annotations
 
-import ast
 import json
 import re
 import uuid
@@ -72,34 +71,71 @@ _PARAMETER_BLOCK_RE = re.compile(
 # XML-style tool-call formats render argument values verbatim inside
 # ``<parameter=…>`` tags with no quoting. ``true`` and the string
 # ``"true"`` produce identical wire bytes; without the tool schema, the
-# parser has no signal to distinguish them. We mirror vLLM's
-# ``Qwen3CoderToolParser`` (and SGLang's ``Qwen3CoderDetector``) end to
-# end: case-insensitive ``null`` short-circuit, ``int()`` / ``float()``
-# for numeric types, ``.lower() == "true"`` for bool, ``json.loads``
-# with ``ast.literal_eval`` fallback for objects/arrays. That accepts
-# both JSON literals (Qwen3.6) and Python literals (Qwen3.5 — ``str()``
-# renders bools as ``True`` / ``False``) on the inference side.
+# parser has no signal to distinguish them. We mirror vLLM's shared
+# ``extract_types_from_schema`` + ``coerce_to_schema_type`` helpers in
+# ``vllm/tool_parsers/utils.py``:
 #
-# Why ``qwen3_coder`` and not ``qwen3_xml``: vLLM ships two parsers for
-# the same wire format. ``qwen3_xml`` is the newer streaming-first
-# parser (uses ``xml.parsers.expat`` and is the recommended choice for
-# *live serving* because ``qwen3_coder`` has known infinite-loop bugs
-# in vLLM's streaming path). For offline token-level extraction the
-# two parsers agree on JSON-literal scalars but ``qwen3_coder`` is a
-# strict superset for value coercion — it accepts Python literals via
-# ``ast.literal_eval`` where ``qwen3_xml`` returns raw strings. Since
-# this repo doesn't stream yet, ``qwen3_coder`` semantics dominate.
+# 1. Flatten the JSON-Schema fragment to a set of types, recursing
+#    through ``anyOf`` / ``oneOf`` / ``allOf`` and inferring types from
+#    ``enum`` values. A schema with no extractable type information
+#    defaults to ``["string"]``.
+# 2. Walk the priority-ordered ladder ``null > integer > number >
+#    boolean > object > array > string``, returning the first
+#    successful coercion. ``string`` is the always-succeeding terminal
+#    whenever it appears in the type set, which subsumes both pure
+#    string params and union types like ``Union[str, bool]``.
+#
+# Why ``qwen3_coder`` semantics and not ``qwen3_xml``: vLLM ships two
+# parsers for the same wire format. ``qwen3_xml`` is the newer
+# streaming-first parser (uses ``xml.parsers.expat`` and is the
+# recommended choice for *live serving* because ``qwen3_coder`` has
+# known infinite-loop bugs in vLLM's streaming path). For offline
+# token-level extraction we follow ``qwen3_coder``, which itself routes
+# through the shared ``coerce_to_schema_type`` helper above — so the
+# two converge on scalar semantics in non-streaming use.
 # TODO: when a streaming parse API lands, switch the streaming path to
 # ``qwen3_xml``-style state-machine semantics to dodge vLLM's
 # regex-streaming bugs (see HF Qwen3-Coder-Next discussion #17).
 
 
-_STRING_TYPES = frozenset({"string", "str", "text", "varchar", "char", "enum"})
-_BOOL_TYPES = frozenset({"boolean", "bool", "binary"})
-_OBJECT_TYPES = frozenset({"object", "array", "arr"})
-_INT_PREFIXES = ("int", "uint", "long", "short", "unsigned")
-_FLOAT_PREFIXES = ("num", "float")
-_OBJECT_PREFIXES = ("dict", "list")
+# Type aliases mirror ``vllm/tool_parsers/utils.py:_TYPE_ALIASES``.
+_TYPE_ALIASES: dict[str, str] = {
+    "str": "string",
+    "text": "string",
+    "varchar": "string",
+    "char": "string",
+    "enum": "string",
+    "int": "integer",
+    "int32": "integer",
+    "int64": "integer",
+    "uint": "integer",
+    "uint32": "integer",
+    "uint64": "integer",
+    "long": "integer",
+    "short": "integer",
+    "unsigned": "integer",
+    "float": "number",
+    "float32": "number",
+    "float64": "number",
+    "double": "number",
+    "bool": "boolean",
+    "dict": "object",
+    "arr": "array",
+    "list": "array",
+    "sequence": "array",
+}
+
+
+# Priority order mirrors ``vllm/tool_parsers/utils.py:coerce_to_schema_type``.
+_TYPE_PRIORITY = (
+    "null",
+    "integer",
+    "number",
+    "boolean",
+    "object",
+    "array",
+    "string",
+)
 
 
 def _build_param_type_index(
@@ -128,112 +164,118 @@ def _build_param_type_index(
     return index
 
 
-def _declared_type(param_schema: dict[str, Any] | None) -> str | None:
-    """Extract the lowercased ``type`` from a JSON-schema fragment.
+def _extract_types_from_schema(schema: Any) -> list[str]:
+    """Flatten a JSON-Schema fragment to a list of type strings.
 
-    Mirrors vLLM: a fragment with ``anyOf`` and no top-level ``type`` is
-    treated as ``"object"`` so json.loads is attempted; a list-form type
-    falls back to the first declared entry.
+    Byte-for-byte port of ``vllm/tool_parsers/utils.py:extract_types_from_schema``:
+    handles top-level ``type`` (string or list), infers types from
+    ``enum`` values, and recurses through ``anyOf`` / ``oneOf`` /
+    ``allOf``. Returns ``["string"]`` when no type information can be
+    determined — which makes the no-schema branch coerce to ``string``
+    via the priority-ordered ladder in :func:`_coerce_arg_value`.
     """
-    if not isinstance(param_schema, dict):
-        return None
-    declared = param_schema.get("type")
-    if isinstance(declared, str):
-        return declared.strip().lower()
-    if isinstance(declared, list) and declared:
-        first = declared[0]
-        if isinstance(first, str):
-            return first.strip().lower()
-    if "anyOf" in param_schema:
-        return "object"
-    return None
+    if schema is None or not isinstance(schema, dict):
+        return ["string"]
+
+    types: set[str] = set()
+
+    if "type" in schema:
+        type_value = schema["type"]
+        if isinstance(type_value, str):
+            types.add(type_value)
+        elif isinstance(type_value, list):
+            for t in type_value:
+                if isinstance(t, str):
+                    types.add(t)
+
+    if "enum" in schema and isinstance(schema["enum"], list) and schema["enum"]:
+        for value in schema["enum"]:
+            if value is None:
+                types.add("null")
+            elif isinstance(value, bool):
+                types.add("boolean")
+            elif isinstance(value, int):
+                types.add("integer")
+            elif isinstance(value, float):
+                types.add("number")
+            elif isinstance(value, str):
+                types.add("string")
+            elif isinstance(value, list):
+                types.add("array")
+            elif isinstance(value, dict):
+                types.add("object")
+
+    for choice_field in ("anyOf", "oneOf", "allOf"):
+        if choice_field in schema and isinstance(schema[choice_field], list):
+            for choice in schema[choice_field]:
+                types.update(_extract_types_from_schema(choice))
+
+    return list(types) if types else ["string"]
 
 
 def _coerce_arg_value(
     text: str, param_schema: dict[str, Any] | None
 ) -> tuple[Any, bool]:
-    """Coerce a raw ``<parameter=…>`` body to its declared type.
+    """Coerce a raw ``<parameter=…>`` body to its schema type.
 
-    Returns ``(value, used_fallback)``. ``used_fallback=True`` means the
-    coercion could not satisfy the declared type and had to fall back to
-    a different shape (a string for scalars, ``False`` for booleans, raw
-    text for objects), so the caller can flag ``INVALID_JSON``.
+    Mirrors vLLM ``coerce_to_schema_type`` (``vllm/tool_parsers/utils.py``):
+    flatten the schema to a set of JSON-Schema types (recursing through
+    ``anyOf``/``oneOf``/``allOf`` and ``enum``), then walk a priority-
+    ordered ladder ``null > integer > number > boolean > object > array
+    > string``, returning the first successful coercion. ``string`` is
+    the always-succeeding terminal whenever it is in the type set.
 
-    The ladder mirrors vLLM's ``Qwen3CoderToolParser._convert_param_value``
-    and SGLang's ``Qwen3CoderDetector._convert_param_value`` byte-for-byte:
-
-    - ``null`` short-circuit (any case) → ``None``. Runs **before** any
-      type check, including the string family. vLLM does this on line
-      125 of ``qwen3coder_tool_parser.py`` ahead of the
-      ``param_name not in param_config`` branch. This means a
-      string-typed arg whose wire value is the literal ``null``
-      collapses to Python ``None`` — the XML wire format can't
-      distinguish that case from a JSON null, and we accept the
-      lossy round-trip in exchange for byte parity with vLLM.
-    - No schema OR param not in schema → return verbatim. vLLM
-      ``qwen3coder_tool_parser.py:128-137``:
-      ``if param_name not in param_config: return param_value``.
-    - ``string`` / ``str`` / ``text`` / ``varchar`` / ``char`` / ``enum``
-      → return verbatim.
-    - ``int`` / ``uint`` / ``long`` / ``short`` / ``unsigned`` family →
-      ``int(text)``, degenerating to raw text + INVALID.
-    - ``num`` / ``float`` family → ``float(text)`` with int demotion
-      when the source has no ``.``/``e`` and is whole, degenerating to
-      raw text + INVALID.
-    - ``boolean`` / ``bool`` / ``binary`` → ``text.lower() == "true"``;
-      anything outside ``{"true", "false"}`` returns ``False`` + INVALID
-      (matches vLLM's "degenerate to false" behavior, with the
-      INVALID flag preserved for the verifier / RL-loss signal).
-    - ``object`` / ``array`` / ``dict`` / ``list`` (or ``anyOf``) →
-      ``json.loads`` first, ``ast.literal_eval`` fallback (for Python
-      literals like ``{'k': 1}``), raw text + INVALID otherwise.
-    - Any other declared type → ``ast.literal_eval`` if it parses, else
-      raw text. Matches vLLM's catch-all else branch.
+    Returns ``(value, used_fallback)``. ``used_fallback=True`` iff
+    every type in the schema declined the value AND the last-ditch
+    ``json.loads`` of the raw text also failed — i.e. the value
+    couldn't be expressed as anything the schema permits. The renderer
+    propagates that flag to ``ToolCallParseStatus.INVALID_JSON`` for the
+    verifier / RL-loss signal; vLLM has no such signal.
     """
-    if text.lower() == "null":
-        return None, False
+    schema_types = _extract_types_from_schema(param_schema)
+    normalized_types = {
+        _TYPE_ALIASES.get(key, key)
+        for t in schema_types
+        if isinstance(t, str)
+        for key in [t.strip().lower()]
+    }
 
-    declared = _declared_type(param_schema)
-
-    if param_schema is None or declared is None or declared in _STRING_TYPES:
-        return text, False
-
-    if declared.startswith(_INT_PREFIXES):
-        try:
-            return int(text), False
-        except (ValueError, TypeError):
-            return text, True
-
-    if declared.startswith(_FLOAT_PREFIXES):
-        try:
-            f = float(text)
-        except (ValueError, TypeError):
-            return text, True
-        if "." not in text and "e" not in text.lower() and f.is_integer():
-            return int(f), False
-        return f, False
-
-    if declared in _BOOL_TYPES:
-        lowered = text.lower()
-        if lowered == "true":
-            return True, False
-        if lowered == "false":
-            return False, False
-        return False, True
-
-    if declared in _OBJECT_TYPES or declared.startswith(_OBJECT_PREFIXES):
-        try:
-            return json.loads(text), False
-        except (json.JSONDecodeError, ValueError):
-            pass
-        try:
-            return ast.literal_eval(text), False
-        except (ValueError, SyntaxError, TypeError, MemoryError):
-            return text, True
+    for candidate in _TYPE_PRIORITY:
+        if candidate not in normalized_types:
+            continue
+        if candidate == "null":
+            if text.lower() == "null":
+                return None, False
+            continue
+        if candidate == "string":
+            return text, False
+        if candidate == "integer":
+            try:
+                return int(text), False
+            except (ValueError, TypeError):
+                continue
+        if candidate == "number":
+            try:
+                val = float(text)
+            except (ValueError, TypeError):
+                continue
+            return (val if val != int(val) else int(val)), False
+        if candidate == "boolean":
+            lowered = text.lower().strip()
+            if lowered in ("true", "1"):
+                return True, False
+            if lowered in ("false", "0"):
+                return False, False
+            continue
+        if candidate in ("object", "array"):
+            try:
+                return json.loads(text), False
+            except (json.JSONDecodeError, ValueError, TypeError):
+                continue
 
     try:
-        return ast.literal_eval(text), False
-    except (ValueError, SyntaxError, TypeError, MemoryError):
+        return json.loads(text), False
+    except (json.JSONDecodeError, ValueError):
         return text, True
 
 

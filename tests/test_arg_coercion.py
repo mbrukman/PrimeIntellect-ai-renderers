@@ -40,38 +40,47 @@ def test_boolean_accepts_case_insensitive(raw, expected):
     assert used_fallback is False
 
 
-@pytest.mark.parametrize("declared", ["boolean", "bool", "binary"])
+@pytest.mark.parametrize("declared", ["boolean", "bool"])
 def test_boolean_type_aliases_all_accepted(declared):
     value, used_fallback = _coerce_arg_value("True", {"type": declared})
     assert value is True
     assert used_fallback is False
 
 
-def test_boolean_garbage_degenerates_to_false_with_invalid_flag():
-    """Match vLLM: non-true/false values silently become ``False`` — but we
-    still flag the fallback so verifier / RL-loss code can see the drift."""
+def test_boolean_garbage_keeps_raw_text_with_invalid_flag():
+    """vLLM ``coerce_to_schema_type``: when the boolean branch declines
+    (value not in ``{true, false, 1, 0}``) and no other type in the
+    schema accepts the value, the terminal ``json.loads`` is attempted
+    and on failure the raw text is returned. We surface that path
+    via ``used_fallback=True`` for the verifier / RL-loss signal."""
     value, used_fallback = _coerce_arg_value("yes", {"type": "boolean"})
-    assert value is False
+    assert value == "yes"
     assert used_fallback is True
 
 
-@pytest.mark.parametrize("declared", ["boolean", "integer", "object", "number"])
-def test_null_literal_is_case_insensitive_for_non_string_types(declared):
+@pytest.mark.parametrize(
+    "declared",
+    [["boolean", "null"], ["integer", "null"], ["number", "null"], ["object", "null"]],
+)
+def test_null_coerces_when_null_is_in_type_set(declared):
+    """vLLM null-coerces only when ``"null"`` is one of the declared
+    schema types — typically via JSON-Schema array-form ``["X", "null"]``
+    (the ``Optional[X]`` shape) or via ``anyOf: [..., {"type": "null"}]``.
+    Case-insensitive: matches ``null`` / ``Null`` / ``NULL``."""
     for raw in ("null", "Null", "NULL"):
         value, used_fallback = _coerce_arg_value(raw, {"type": declared})
         assert value is None
         assert used_fallback is False
 
 
-def test_null_short_circuit_applies_even_for_string_type():
-    """vLLM ``qwen3coder_tool_parser.py:125`` null-coerces ``"null"``
-    *before* the type check, so a string-typed wire value of ``null``
-    collapses to Python ``None``. The XML wire format can't tell the
-    string ``"null"`` from JSON null; we accept the lossy round-trip
-    in exchange for byte parity with vLLM."""
+def test_string_typed_null_returns_verbatim():
+    """Pure string-typed param: ``"null"`` on the wire is just the
+    string ``"null"`` — no null coercion because ``"null"`` is not in
+    the schema's type set. Byte parity with vLLM
+    ``coerce_to_schema_type`` (string branch always succeeds)."""
     for raw in ("null", "Null", "NULL"):
         value, used_fallback = _coerce_arg_value(raw, {"type": "string"})
-        assert value is None
+        assert value == raw
         assert used_fallback is False
 
 
@@ -103,10 +112,13 @@ def test_int_failure_keeps_raw_and_flags_fallback():
     "raw,expected,exact_type",
     [
         ("3.14", 3.14, float),
-        ("1e3", 1000.0, float),  # source has `e` → stays float (SGLang rule)
-        ("1.0", 1.0, float),  # source has `.` → stays float
         ("-2.5", -2.5, float),
-        ("7", 7, int),  # no `.`/`e` and whole → demoted to int
+        # vLLM ``coerce_to_schema_type`` int-demotes whenever the parsed
+        # float is a whole number, regardless of source-string shape —
+        # so ``1e3``, ``1.0``, and ``7`` all become int.
+        ("1e3", 1000, int),
+        ("1.0", 1, int),
+        ("7", 7, int),
     ],
 )
 def test_float_family_coerces(raw, expected, exact_type):
@@ -128,12 +140,15 @@ def test_object_via_json_loads():
     assert used_fallback is False
 
 
-def test_object_via_ast_literal_eval_fallback():
-    """Python-literal dicts (single quotes) should still parse for object
-    params — this is the vLLM ``ast.literal_eval`` fallback path."""
+def test_object_python_literal_does_not_parse():
+    """vLLM ``coerce_to_schema_type`` only uses ``json.loads`` for
+    object/array types — no ``ast.literal_eval`` fallback. Python-style
+    single-quoted dicts therefore land on the terminal raw-text path
+    and get flagged. (Renderers' previous ``ast.literal_eval`` fallback
+    was a vLLM deviation; we dropped it for parity.)"""
     value, used_fallback = _coerce_arg_value("{'k': 1}", {"type": "object"})
-    assert value == {"k": 1}
-    assert used_fallback is False
+    assert value == "{'k': 1}"
+    assert used_fallback is True
 
 
 def test_array_via_json_loads():
@@ -150,12 +165,35 @@ def test_object_total_failure_flags_invalid():
     assert used_fallback is True
 
 
-def test_anyof_treated_as_object():
-    """vLLM-specific: a schema with ``anyOf`` and no top-level ``type``
-    routes through the object branch so JSON-shaped values parse."""
+def test_anyof_recursively_flattens_types():
+    """vLLM ``extract_types_from_schema`` recurses through ``anyOf`` /
+    ``oneOf`` / ``allOf`` to build the type set. ``Union[int, str]`` ⇒
+    ``{integer, string}``: integer parses first, falling back to string
+    for non-numeric values — and a bare string never gets flagged
+    because the string branch is the always-succeeding terminal."""
     schema = {"anyOf": [{"type": "integer"}, {"type": "string"}]}
+
+    # Integer-shaped wire value rides the integer branch.
     value, used_fallback = _coerce_arg_value("42", schema)
     assert value == 42
+    assert used_fallback is False
+
+    # Non-numeric wire value declines integer, lands on string. The
+    # exact regression from PR #63: pre-fix, this was flagged
+    # ``INVALID_JSON`` because top-level ``type`` was absent and the
+    # parser tried ``json.loads("LIS")``. vLLM's recursive flatten +
+    # priority-ordered ladder fixes that as a side effect.
+    value, used_fallback = _coerce_arg_value("LIS", schema)
+    assert value == "LIS"
+    assert used_fallback is False
+
+
+def test_oneof_with_string_branch_recovers_bare_strings():
+    """Same recursive-flatten path as ``anyOf``: ``oneOf`` with a
+    string branch must accept bare-string wire values without flagging."""
+    schema = {"oneOf": [{"type": "integer"}, {"type": "string"}]}
+    value, used_fallback = _coerce_arg_value("hello", schema)
+    assert value == "hello"
     assert used_fallback is False
 
 
@@ -175,11 +213,11 @@ def test_string_with_list_form_type():
 
 
 def test_no_schema_returns_verbatim_string():
-    """vLLM ``qwen3coder_tool_parser.py:128-137``: when the param is
-    not in the tool schema (or no tools were passed at all), the parser
-    returns the raw text verbatim — it does **not** try ``json.loads``.
-    The case-insensitive ``null`` short-circuit at the top of the ladder
-    still applies (so untyped ``"null"`` becomes Python ``None``)."""
+    """vLLM ``extract_types_from_schema(None)`` returns ``["string"]``,
+    which routes every value through the always-succeeding string
+    branch of the priority ladder. Untyped ``"null"`` therefore stays
+    a string — there is no top-level null short-circuit ahead of the
+    type check."""
     value, used_fallback = _coerce_arg_value("42", None)
     assert value == "42"
     assert used_fallback is False
@@ -192,25 +230,21 @@ def test_no_schema_returns_verbatim_string():
     assert value == "hello"
     assert used_fallback is False
 
-
-def test_no_schema_null_short_circuit():
-    """vLLM null-coerces before the schema-missing return, so an untyped
-    ``"null"`` still becomes Python ``None``."""
-    for raw in ("null", "Null", "NULL"):
-        value, used_fallback = _coerce_arg_value(raw, None)
-        assert value is None
-        assert used_fallback is False
+    value, used_fallback = _coerce_arg_value("null", None)
+    assert value == "null"
+    assert used_fallback is False
 
 
-def test_unknown_type_falls_back_to_literal_eval():
-    """A declared type we don't recognise (e.g. ``"date"``) lands in the
-    catch-all that tries ``ast.literal_eval``, mirroring vLLM's else
-    branch — strings without quotes that fail to eval stay as strings."""
+def test_unknown_type_falls_through_to_terminal_json_loads():
+    """A declared type the priority ladder doesn't recognise (e.g.
+    ``"date"``) skips every typed branch and lands on the terminal
+    ``json.loads``. JSON-shaped values still parse; everything else
+    keeps the raw text and gets flagged."""
     value, used_fallback = _coerce_arg_value("2024-01-01", {"type": "date"})
     assert value == "2024-01-01"
     assert used_fallback is True
 
-    # Bare Python literal still parses through the catch-all
+    # JSON-shaped value rides the terminal ``json.loads``.
     value, used_fallback = _coerce_arg_value("[1, 2]", {"type": "date"})
     assert value == [1, 2]
     assert used_fallback is False
