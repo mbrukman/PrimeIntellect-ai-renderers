@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any, cast
 
 import httpx
@@ -248,11 +249,34 @@ async def generate(
         "token_ids": prompt_ids,
         "sampling_params": sp,
     }
-    features = (
-        _build_mm_features(renderer, mm_data)
-        if mm_data and not mm_data.is_empty()
-        else None
+    # Multimodal: ``mm_data`` carried into the rollout is descriptor-only
+    # (no ``pixel_values``) so the env worker never retains decoded image
+    # tensors. Re-attach pixels for the POST via ``materialize_pixels``
+    # (cache hit, else reprocess from the message base64), build the engine
+    # features, then strip pixels again so the value handed back to the
+    # trajectory stays descriptor-only.
+    def _features_and_descriptor_mm() -> (
+        "tuple[dict[str, Any] | None, MultiModalData | None]"
+    ):
+        if mm_data is None or mm_data.is_empty():
+            return None, mm_data
+        # ``materialize_pixels`` lives on multimodal renderers + the pool, not
+        # the base ``Renderer`` protocol; reached only when ``mm_data`` is
+        # non-empty, which implies a multimodal renderer.
+        full_mm = cast(Any, renderer).materialize_pixels(mm_data, messages)
+        return _build_mm_features(renderer, full_mm), _strip_pixels(mm_data)
+
+    features, out_mm_data = await _maybe_offload(
+        renderer, _features_and_descriptor_mm
     )
+    # ``prompt_attr.multi_modal_data`` aliases the original pixel-bearing
+    # ``mm_data``; rebind it to the stripped copy so the attribution surfaced
+    # to the trajectory is also descriptor-only.
+    if (
+        prompt_attr is not None
+        and getattr(prompt_attr, "multi_modal_data", None) is not None
+    ):
+        prompt_attr = replace(prompt_attr, multi_modal_data=out_mm_data)
     if features is not None:
         body["features"] = features
     if cache_salt is not None:
@@ -321,8 +345,11 @@ async def generate(
         "routed_experts": routed_experts,
         # The mm sidecar consumed on the request side, surfaced back so
         # callers can persist it on the trajectory step for downstream
-        # multi-turn bridging and training-sample construction.
-        "multi_modal_data": mm_data,
+        # multi-turn bridging and training-sample construction. Descriptor
+        # only (``pixel_values`` stripped) — the env worker keeps no decoded
+        # tensors; pixels are re-derived for the next-turn POST and for
+        # training-sample construction.
+        "multi_modal_data": out_mm_data,
         # The renderer's per-token attribution for the prompt — either
         # the RenderedTokens computed here via renderer.render(...) or
         # the one threaded in by the caller alongside prompt_ids (the
@@ -332,6 +359,27 @@ async def generate(
         # when the caller passed prompt_ids without attribution.
         "prompt_attribution": prompt_attr,
     }
+
+
+def _strip_pixels(mm_data: MultiModalData) -> MultiModalData:
+    """Return ``mm_data`` with ``pixel_values`` dropped from every item.
+
+    Keeps the descriptor (``image_grid_thw`` etc.), ``mm_hashes`` and
+    ``mm_placeholders`` — everything needed for token alignment and for
+    re-deriving pixels later (POST via ``materialize_pixels``; training via
+    the orchestrator). The decoded pixel tensors are never retained on the
+    trajectory, which is what keeps env-worker memory flat across a rollout.
+    """
+    if not mm_data.mm_items:
+        return mm_data
+    new_items = {
+        modality: [
+            {k: v for k, v in item.items() if k != "pixel_values"}
+            for item in items
+        ]
+        for modality, items in mm_data.mm_items.items()
+    }
+    return replace(mm_data, mm_items=new_items)
 
 
 def _build_mm_features(

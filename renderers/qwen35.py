@@ -38,6 +38,7 @@ from renderers.qwen3_vl import (
     _is_image_part,
     _is_video_part,
     _load_pil_image,
+    materialize_image_pixels,
 )
 
 # ---------------------------------------------------------------------------
@@ -193,6 +194,13 @@ class Qwen35Renderer:
             self._image_cache.pop(next(iter(self._image_cache)))
         self._image_cache[h] = (out, num_image_tokens)
         return pil, out, num_image_tokens, h
+
+    def materialize_pixels(
+        self, mm_data: MultiModalData, messages: list[Message]
+    ) -> MultiModalData:
+        """Re-attach pixel_values to descriptor-only mm_data; see
+        :func:`materialize_image_pixels`."""
+        return materialize_image_pixels(self, mm_data, messages)
 
     @staticmethod
     def _content_has_media(content: Any) -> bool:
@@ -813,18 +821,22 @@ class Qwen35Renderer:
             emit_text("\n\n", -1)
 
         # Merge prev mm_data (images from earlier turns) with the new turn's.
+        # Copy the inner lists (not just the dict) so ``.extend`` below never
+        # mutates ``previous_multi_modal_data`` in place — earlier trajectory
+        # steps alias that object, and mutating it corrupts their per-step
+        # cumulative set (and the downstream delta encoding).
         merged_hashes: dict[str, list[str]] = (
-            dict(previous_multi_modal_data.mm_hashes)
+            {k: list(v) for k, v in previous_multi_modal_data.mm_hashes.items()}
             if previous_multi_modal_data
             else {}
         )
         merged_placeholders: dict[str, list[PlaceholderRange]] = (
-            dict(previous_multi_modal_data.mm_placeholders)
+            {k: list(v) for k, v in previous_multi_modal_data.mm_placeholders.items()}
             if previous_multi_modal_data
             else {}
         )
         merged_items: dict[str, list[dict[str, Any]]] = (
-            dict(previous_multi_modal_data.mm_items)
+            {k: list(v) for k, v in previous_multi_modal_data.mm_items.items()}
             if previous_multi_modal_data
             else {}
         )

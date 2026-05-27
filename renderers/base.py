@@ -877,6 +877,10 @@ class RendererPool:
         with self.checkout() as r:
             return r.bridge_to_next_turn(*args, **kwargs)
 
+    def materialize_pixels(self, *args: Any, **kwargs: Any) -> "MultiModalData":
+        with self.checkout() as r:
+            return r.materialize_pixels(*args, **kwargs)
+
     # ``mm_token_type_id_map`` (the MultimodalRenderer protocol attribute)
     # is set in ``__init__`` only for pools wrapping multimodal renderers;
     # see the comment there for why this isn't a class-level property.

@@ -162,6 +162,96 @@ def _image_hash(pil_image) -> str:
     return h.hexdigest()[:32]
 
 
+def _iter_image_parts(messages: "list[Any]"):
+    """Yield image content parts from a message list, in conversation order."""
+    for msg in messages or []:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if isinstance(item, dict) and _is_image_part(item):
+                yield item
+
+
+def _grids_equal(a: Any, b: Any) -> bool:
+    if a is None or b is None:
+        return False
+    al = a.tolist() if hasattr(a, "tolist") else list(a)
+    bl = b.tolist() if hasattr(b, "tolist") else list(b)
+    return al == bl
+
+
+def materialize_image_pixels(
+    renderer: Any, mm_data: MultiModalData, messages: "list[Any]"
+) -> MultiModalData:
+    """Return a pixel-complete copy of ``mm_data``.
+
+    Rollouts retain *descriptor-only* ``mm_data`` (``image_grid_thw`` +
+    ``mm_hashes`` + ``mm_placeholders``, no ``pixel_values``) so the env
+    worker never holds decoded image tensors for the life of a rollout.
+    Before a generate POST the pixels are re-attached here: each image item
+    missing ``pixel_values`` is reprocessed from its base64 in ``messages``
+    via ``renderer._process_image`` (which reuses the per-image cache on a
+    hit), matched back by the renderer's content hash. The reconstructed
+    ``image_grid_thw`` is asserted equal to the descriptor's so a processor
+    skew can never silently change the placeholder count.
+    """
+    from dataclasses import replace
+
+    image_items = mm_data.mm_items.get("image") or []
+    if not image_items:
+        return mm_data
+    hashes = mm_data.mm_hashes.get("image") or []
+    if len(hashes) != len(image_items):
+        raise ValueError(
+            "materialize_image_pixels: mm_hashes/mm_items length mismatch "
+            f"({len(hashes)} vs {len(image_items)})"
+        )
+    missing = {
+        hashes[i]
+        for i, item in enumerate(image_items)
+        if item.get("pixel_values") is None
+    }
+    if not missing:
+        return mm_data
+
+    resolved: dict[str, dict[str, Any]] = {}
+    for part in _iter_image_parts(messages):
+        if not missing:
+            break
+        _, out, _, h = renderer._process_image(part)
+        if h in missing:
+            resolved[h] = out
+            missing.discard(h)
+    if missing:
+        raise ValueError(
+            f"materialize_image_pixels: {len(missing)} image hash(es) not "
+            "found in messages; cannot reconstruct pixel_values"
+        )
+
+    new_image_items: list[dict[str, Any]] = []
+    for i, item in enumerate(image_items):
+        if item.get("pixel_values") is not None:
+            new_image_items.append(item)
+            continue
+        out = resolved[hashes[i]]
+        if not _grids_equal(out["image_grid_thw"], item.get("image_grid_thw")):
+            raise ValueError(
+                "materialize_image_pixels: reconstructed image_grid_thw "
+                f"{out['image_grid_thw']!r} != descriptor "
+                f"{item.get('image_grid_thw')!r} (processor skew?)"
+            )
+        new_image_items.append(
+            {
+                "pixel_values": out["pixel_values"],
+                "image_grid_thw": out["image_grid_thw"],
+            }
+        )
+    new_items = dict(mm_data.mm_items)
+    new_items["image"] = new_image_items
+    return replace(mm_data, mm_items=new_items)
+
+
 class _Emitter:
     """Token-stream builder with BPE-safe text buffering.
 
@@ -432,6 +522,13 @@ class Qwen3VLRenderer:
             self._image_cache.pop(next(iter(self._image_cache)))
         self._image_cache[h] = (out, num_image_tokens)
         return pil, out, num_image_tokens, h
+
+    def materialize_pixels(
+        self, mm_data: MultiModalData, messages: list[Message]
+    ) -> MultiModalData:
+        """Re-attach pixel_values to descriptor-only mm_data; see
+        :func:`materialize_image_pixels`."""
+        return materialize_image_pixels(self, mm_data, messages)
 
     def render(
         self,
@@ -802,19 +899,22 @@ class Qwen3VLRenderer:
         em.text("assistant\n", is_sampled=False, is_content=False)
         em.finalize()
 
-        # Merge prev mm_data with the new turn's items.
+        # Merge prev mm_data with the new turn's items. Copy the inner lists
+        # (not just the dict) so ``.extend`` never mutates
+        # ``previous_multi_modal_data`` in place — earlier trajectory steps
+        # alias it, and mutating it corrupts their per-step cumulative set.
         merged_hashes = (
-            dict(previous_multi_modal_data.mm_hashes)
+            {k: list(v) for k, v in previous_multi_modal_data.mm_hashes.items()}
             if previous_multi_modal_data
             else {}
         )
         merged_placeholders = (
-            dict(previous_multi_modal_data.mm_placeholders)
+            {k: list(v) for k, v in previous_multi_modal_data.mm_placeholders.items()}
             if previous_multi_modal_data
             else {}
         )
         merged_items = (
-            dict(previous_multi_modal_data.mm_items)
+            {k: list(v) for k, v in previous_multi_modal_data.mm_items.items()}
             if previous_multi_modal_data
             else {}
         )
