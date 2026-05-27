@@ -17,12 +17,14 @@ from renderers.base import (
     ParsedResponse,
     ParsedToolCall,
     PlaceholderRange,
+    Processor,
     RenderedConversation,
     RenderedTokens,
     Renderer,
     RendererPool,
     TextPart,
     ThinkingPart,
+    Tokenizer,
     ToolCall,
     ToolCallFunction,
     ToolCallParseStatus,
@@ -37,7 +39,6 @@ from renderers.base import (
     reject_assistant_in_extension,
     trim_to_turn_close,
 )
-from renderers.client import OverlongPromptError
 from renderers.configs import (
     AutoRendererConfig,
     BaseRendererConfig,
@@ -62,15 +63,27 @@ from renderers.configs import (
 
 # Concrete renderer classes are lazy-loaded so that consumers needing
 # only the config layer (``RendererConfig`` discriminated union) don't
-# pay the ``transformers`` import cost. Each renderer module does
-# ``from transformers.tokenization_utils import PreTrainedTokenizer``
-# at module level, so eager imports here would drag ``transformers``
-# into every downstream ``import renderers``. ``__getattr__`` (PEP 562)
-# resolves the names on first attribute access, so ``from renderers
-# import DefaultRenderer`` and ``renderers.DefaultRenderer`` both work
-# transparently. ``create_renderer`` doesn't depend on these eager
-# imports — ``renderers.base._populate_registry`` lazy-imports the
-# concrete classes itself when a renderer is instantiated.
+# pay the cost of importing every renderer module up front. ``__getattr__``
+# (PEP 562) resolves the names on first attribute access, so ``from
+# renderers import DefaultRenderer`` and ``renderers.DefaultRenderer`` both
+# work transparently. ``create_renderer`` doesn't depend on these eager
+# imports — ``renderers.base._populate_registry`` lazy-imports the concrete
+# classes itself when a renderer is instantiated.
+#
+# As of issue #31, ``transformers`` is an optional extra: the renderer
+# modules type their ``tokenizer`` / ``processor`` params against the
+# ``Tokenizer`` / ``Processor`` protocols in ``renderers.base`` rather than
+# ``transformers.PreTrainedTokenizer``, so ``import renderers`` (and
+# constructing a text renderer with your own tokenizer) no longer pulls in
+# ``transformers`` at all. It's loaded lazily only by ``load_tokenizer`` /
+# ``create_renderer*`` and the VLM renderers — see ``_require_transformers``.
+#
+# ``renderers.client`` (the vLLM ``/inference/v1/generate`` client) is
+# likewise opt-in: it depends on the ``openai`` SDK + ``httpx`` (the
+# ``renderers[vllm]`` extra) and is deliberately *not* imported here, so
+# ``import renderers`` stays free of HTTP/engine deps. Import it explicitly
+# (``from renderers.client import generate, OverlongPromptError``) when you
+# want it.
 _LAZY_RENDERERS: dict[str, str] = {
     "DeepSeekV3Renderer": "renderers.deepseek_v3",
     "DefaultRenderer": "renderers.default",
@@ -137,10 +150,10 @@ __all__ = [
     "MultimodalRenderer",
     "Nemotron3Renderer",
     "Nemotron3RendererConfig",
-    "OverlongPromptError",
     "ParsedResponse",
     "ParsedToolCall",
     "PlaceholderRange",
+    "Processor",
     "Qwen35Renderer",
     "Qwen35RendererConfig",
     "Qwen36Renderer",
@@ -156,6 +169,7 @@ __all__ = [
     "RendererPool",
     "TextPart",
     "ThinkingPart",
+    "Tokenizer",
     "ToolCall",
     "ToolCallFunction",
     "ToolCallParseStatus",

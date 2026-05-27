@@ -14,12 +14,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from transformers.tokenization_utils import PreTrainedTokenizer
-
 from renderers.base import (
     Message,
     ParsedResponse,
     RenderedTokens,
+    Tokenizer,
     ToolSpec,
     attribute_text_segments,
     reject_assistant_in_extension,
@@ -62,7 +61,7 @@ class GLM5Renderer:
 
     def __init__(
         self,
-        tokenizer: PreTrainedTokenizer,
+        tokenizer: Tokenizer,
         config: GLM5RendererConfig | GLM51RendererConfig | None = None,
     ):
         self._tokenizer = tokenizer

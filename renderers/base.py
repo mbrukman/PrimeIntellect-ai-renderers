@@ -563,6 +563,60 @@ class RenderedConversation:
 
 
 @runtime_checkable
+class Tokenizer(Protocol):
+    """Structural type for the tokenizer a renderer needs.
+
+    Satisfied by HuggingFace ``PreTrainedTokenizerBase`` and by any
+    bring-your-own wrapper (e.g. around a ``tokenizers.Tokenizer``) that
+    exposes this surface. Defining it here — rather than annotating with
+    ``transformers.PreTrainedTokenizer`` — keeps ``transformers`` out of
+    the import graph for text-only renderers (issue #31): the heavy
+    package becomes an optional extra, needed only by the
+    ``load_tokenizer`` / ``create_renderer`` convenience helpers and by
+    the VLM renderers.
+
+    ``__call__`` is consumed only by ``attribute_text_segments`` for
+    character-offset attribution (``return_offsets_mapping=True``). A
+    tokenizer that doesn't support offsets still renders and parses fine;
+    offset attribution then falls back to a vanilla HuggingFace tokenizer
+    (which requires the ``transformers`` extra) — see
+    ``_get_offset_tokenizer``.
+    """
+
+    name_or_path: str
+    unk_token_id: int | None
+    eos_token_id: int | None
+
+    def encode(self, text: str, *args: Any, **kwargs: Any) -> list[int]: ...
+
+    def decode(self, token_ids: Any, *args: Any, **kwargs: Any) -> str: ...
+
+    def convert_tokens_to_ids(self, tokens: Any) -> Any: ...
+
+    def apply_chat_template(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
+
+
+@runtime_checkable
+class Processor(Protocol):
+    """Structural type for the HuggingFace processor a VLM renderer needs.
+
+    Satisfied by ``AutoProcessor`` instances (Qwen-VL, Kimi-VL, ...). The
+    ``image_processor`` sub-object's surface differs per model family
+    (Qwen exposes ``__call__(images=...)`` + ``merge_size``; Kimi exposes
+    ``preprocess(...)`` + ``media_tokens_calculator``), so it's typed
+    loosely. VLMs intrinsically need ``transformers`` at render time — this
+    Protocol just keeps the ``processor:`` type hint from importing it at
+    module load.
+    """
+
+    image_processor: Any
+
+    def apply_chat_template(self, *args: Any, **kwargs: Any) -> Any: ...
+
+
+@runtime_checkable
 class Renderer(Protocol):
     """Owns message ↔ token conversion for a specific model family."""
 
@@ -1066,6 +1120,32 @@ _FASTOKENS_PATCH_LOCK = threading.Lock()
 _FASTOKENS_ANNOUNCED = False
 
 
+_TRANSFORMERS_INSTALL_HINT = (
+    "This requires the optional `transformers` extra, which is not "
+    "installed. Install it with `pip install 'renderers[transformers]'` "
+    "(or `uv add 'renderers[transformers]'`). Text-only renderers work "
+    "without it when you construct them with your own tokenizer object."
+)
+
+
+def _require_transformers():
+    """Import and return the ``transformers`` module, or raise a clear,
+    actionable error pointing at the optional extra.
+
+    ``transformers`` (and ``fastokens``, which patches it) is an optional
+    dependency — see issue #31. The convenience helpers (``load_tokenizer``,
+    ``create_renderer*``), the offset-attribution fallback, and all VLM
+    renderers need it; text-only render/parse with a bring-your-own
+    tokenizer does not.
+    """
+    try:
+        import transformers
+
+        return transformers
+    except ImportError as exc:
+        raise ImportError(_TRANSFORMERS_INSTALL_HINT) from exc
+
+
 def _patched_load(model_name_or_path: str, **kwargs):
     """Run ``AutoTokenizer.from_pretrained`` with fastokens patched in
     process-locally — patch around the load, unpatch right after.
@@ -1138,8 +1218,11 @@ def load_tokenizer(
     fastokens raises during the patched load (e.g. an unknown
     pre-tokenizer type), we automatically retry with the vanilla
     backend and emit an INFO log.
+
+    Requires the optional ``transformers`` extra; raises a clear
+    ``ImportError`` with install instructions if it's missing.
     """
-    from transformers import AutoTokenizer
+    AutoTokenizer = _require_transformers().AutoTokenizer
 
     kwargs: dict[str, Any] = {}
     revision = TRUSTED_REVISIONS.get(model_name_or_path)
@@ -1524,7 +1607,11 @@ def _get_offset_tokenizer(tokenizer):
         cached = _offset_tokenizers.get(name_or_path)
         if cached is not None:
             return cached
-        from transformers import AutoTokenizer
+        # The supplied tokenizer can't produce offsets; fall back to a
+        # vanilla HuggingFace tokenizer, which needs the ``transformers``
+        # extra. A bring-your-own tokenizer that supports
+        # ``return_offsets_mapping=True`` skips this path entirely.
+        AutoTokenizer = _require_transformers().AutoTokenizer
 
         kwargs: dict[str, Any] = {}
         revision = TRUSTED_REVISIONS.get(name_or_path)

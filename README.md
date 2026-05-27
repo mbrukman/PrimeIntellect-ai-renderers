@@ -10,6 +10,35 @@ Standalone on PyPI, and portable across training and inference stacks (transform
 uv add renderers
 ```
 
+`transformers` is an optional extra. The base install is lightweight — bring
+your own tokenizer (e.g. a `tokenizers`-backed one) and you can render and parse
+text without `transformers` in your environment at all. Install the extra when
+you want the `load_tokenizer` / `create_renderer` convenience helpers, or any of
+the vision-language renderers (they need a HuggingFace image processor):
+
+```bash
+uv add 'renderers[transformers]'
+```
+
+Two caveats for the lightweight path: a bring-your-own tokenizer must satisfy the
+[`Tokenizer`](renderers/base.py) protocol (`encode` / `decode` /
+`convert_tokens_to_ids` / `apply_chat_template`, plus `name_or_path`,
+`unk_token_id`, `eos_token_id`); and per-token training attribution
+(`attribute_text_segments`) additionally needs `tokenizer(..., return_offsets_mapping=True)`
+— without it, attribution falls back to a vanilla HuggingFace tokenizer, which
+requires the extra.
+
+`renderers.client` — the generate client for vLLM's `/inference/v1/generate` — is
+also opt-in. It's the only piece that needs the `openai` SDK and `httpx`, so
+`import renderers` and the renderers themselves stay free of HTTP/engine deps.
+Install the extra to use it:
+
+```bash
+uv add 'renderers[vllm]'
+```
+
+The extras compose, e.g. `uv add 'renderers[transformers,vllm]'`.
+
 ## At a glance
 
 ```python

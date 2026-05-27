@@ -17,14 +17,14 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from transformers.tokenization_utils import PreTrainedTokenizer
-
 from renderers.base import (
     Message,
     MultiModalData,
     ParsedResponse,
     PlaceholderRange,
+    Processor,
     RenderedTokens,
+    Tokenizer,
     ToolSpec,
     attribute_text_segments,
     reject_assistant_in_extension,
@@ -66,7 +66,7 @@ _TOOLS_INSTRUCTIONS = (
 )
 
 
-def _detect_enable_thinking_default(tokenizer: PreTrainedTokenizer) -> bool:
+def _detect_enable_thinking_default(tokenizer: Tokenizer) -> bool:
     """Probe the tokenizer's chat template to learn its ``enable_thinking``
     default polarity at the generation-prompt boundary.
 
@@ -108,10 +108,10 @@ class Qwen35Renderer:
 
     def __init__(
         self,
-        tokenizer: PreTrainedTokenizer,
+        tokenizer: Tokenizer,
         config: Qwen35RendererConfig | None = None,
         *,
-        processor: Any = None,
+        processor: Processor | None = None,
     ):
         self._tokenizer = tokenizer
         self._processor = processor
@@ -157,7 +157,9 @@ class Qwen35Renderer:
     def _get_processor(self):
         if self._processor is not None:
             return self._processor
-        from transformers import AutoProcessor
+        from renderers.base import _require_transformers
+
+        AutoProcessor = _require_transformers().AutoProcessor
 
         name = getattr(self._tokenizer, "name_or_path", None)
         if not name:

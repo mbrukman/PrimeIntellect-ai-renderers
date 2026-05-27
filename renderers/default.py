@@ -11,12 +11,11 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from transformers.tokenization_utils import PreTrainedTokenizer
-
 from renderers.base import (
     Message,
     ParsedResponse,
     RenderedTokens,
+    Tokenizer,
     ToolSpec,
 )
 from renderers.configs import DefaultRendererConfig
@@ -90,7 +89,7 @@ class DefaultRenderer:
 
     def __init__(
         self,
-        tokenizer: PreTrainedTokenizer,
+        tokenizer: Tokenizer,
         config: DefaultRendererConfig | None = None,
     ):
         cfg = config or DefaultRendererConfig()

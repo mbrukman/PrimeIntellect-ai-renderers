@@ -16,25 +16,46 @@ license-files = ["LICENSE"]
 requires-python = ">=3.10,<3.14"
 dependencies = [
     "numpy",
-    "openai>=1.108.1",
     "tiktoken",
     "jinja2",
-    "transformers>=4.50.0",
     # Used by GptOssRenderer to render and parse harmony tokens. Vendoring
     # OpenAI's reference implementation keeps us byte-identical with vLLM
     # (which also uses it) and saves us mirroring a 330-line Jinja template.
     "openai-harmony>=0.0.8",
-    # Crusoe's Rust BPE tokenizer; ~10x faster encode vs HF's tokenizers.
-    # ``load_tokenizer`` patches it in by default for every supported model
-    # except a small denylist (DeepSeek-V3 family). The patch is bracketed
-    # around ``from_pretrained``, so subsequent ``AutoTokenizer`` calls
-    # outside the renderers package stay vanilla.
-    "fastokens>=0.2.0",
     # ``BaseRendererConfig`` inherits from ``pydantic_config.BaseConfig`` so
     # the typed-config surface stays uniform with prime-rl / verifiers config
     # bases. Transitively brings pydantic, which ``renderers.configs`` also
     # imports directly.
     "prime-pydantic-config>=0.3.0.dev83",
+]
+
+[project.optional-dependencies]
+# ``transformers`` is heavy, and text-only renderers don't need it: construct
+# a renderer with your own tokenizer object (e.g. a ``tokenizers``-backed one)
+# and render / parse with no ``transformers`` import at all (issue #31). It is
+# required only by the ``load_tokenizer`` / ``create_renderer*`` convenience
+# helpers, the offset-attribution fallback in ``attribute_text_segments``, and
+# the VLM renderers (which need ``AutoProcessor`` image processors). The lazy
+# import points raise a clear "install renderers[transformers]" error when it's
+# missing — see ``renderers.base._require_transformers``.
+#
+# ``fastokens`` (Crusoe's Rust BPE; ~10x faster encode) patches
+# ``transformers`` inside ``load_tokenizer``, so it travels in the same extra.
+transformers = [
+    "transformers>=4.50.0",
+    "fastokens>=0.2.0",
+]
+
+# ``renderers.client`` is a generate client for vLLM's
+# ``/inference/v1/generate`` — engine-specific glue, not part of the core
+# message↔token contract. It's the only thing that needs the ``openai`` SDK
+# (``AsyncOpenAI``) and ``httpx``, so it's opt-in: ``import renderers`` and the
+# renderers themselves stay free of HTTP/engine deps. Install this extra to use
+# ``from renderers.client import generate``. (A future ``sglang`` client would
+# live behind its own extra.)
+vllm = [
+    "openai>=1.108.1",
+    "httpx",
 ]
 
 [tool.hatch.version]
@@ -69,6 +90,16 @@ dev = [
     "torch>=2.11.0",
     "torchvision>=0.26.0",
     "ty>=0.0.1a29,<0.0.22",
+    # ``transformers`` is an optional extra for consumers (issue #31), but the
+    # test suite + type-check exercise the ``load_tokenizer`` / VLM paths, so
+    # the dev env always installs it. Mirror of ``[project.optional-dependencies].transformers``.
+    "transformers>=4.50.0",
+    "fastokens>=0.2.0",
+    # ``renderers.client`` deps — opt-in via the ``[vllm]`` extra for consumers,
+    # but ``tests/test_client.py`` exercises the client, so the dev env always
+    # installs them. Mirror of ``[project.optional-dependencies].vllm``.
+    "openai>=1.108.1",
+    "httpx",
 ]
 
 [tool.uv]

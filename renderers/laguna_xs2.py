@@ -27,13 +27,12 @@ from __future__ import annotations
 
 import json
 
-from transformers.tokenization_utils import PreTrainedTokenizer
-
 from renderers.base import (
     Content,
     Message,
     ParsedResponse,
     RenderedTokens,
+    Tokenizer,
     ToolSpec,
     attribute_text_segments,
     reject_assistant_in_extension,
@@ -79,7 +78,7 @@ _TOOLS_FOOTER_NO_THINKING = (
 class LagunaXS2Renderer:
     def __init__(
         self,
-        tokenizer: PreTrainedTokenizer,
+        tokenizer: Tokenizer,
         config: LagunaXS2RendererConfig | None = None,
     ):
         self._tokenizer = tokenizer
