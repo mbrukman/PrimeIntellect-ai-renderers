@@ -12,10 +12,10 @@ import json
 from typing import Any
 
 from renderers.base import (
+    ChatTemplateTokenizer,
     Message,
     ParsedResponse,
     RenderedTokens,
-    Tokenizer,
     ToolSpec,
 )
 from renderers.configs import DefaultRendererConfig
@@ -89,7 +89,7 @@ class DefaultRenderer:
 
     def __init__(
         self,
-        tokenizer: Tokenizer,
+        tokenizer: ChatTemplateTokenizer,
         config: DefaultRendererConfig | None = None,
     ):
         cfg = config or DefaultRendererConfig()

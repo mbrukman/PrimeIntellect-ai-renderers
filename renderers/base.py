@@ -575,6 +575,13 @@ class Tokenizer(Protocol):
     ``load_tokenizer`` / ``create_renderer`` convenience helpers and by
     the VLM renderers.
 
+    The hand-coded renderers only need ``encode`` / ``decode`` /
+    ``convert_tokens_to_ids`` (plus the id attributes), so a plain
+    ``tokenizers.Tokenizer`` wrapper satisfies this protocol.
+    ``apply_chat_template`` is deliberately *not* required here — only
+    :class:`DefaultRenderer` needs it, via the :class:`ChatTemplateTokenizer`
+    subtype.
+
     ``__call__`` is consumed only by ``attribute_text_segments`` for
     character-offset attribution (``return_offsets_mapping=True``). A
     tokenizer that doesn't support offsets still renders and parses fine;
@@ -593,9 +600,20 @@ class Tokenizer(Protocol):
 
     def convert_tokens_to_ids(self, tokens: Any) -> Any: ...
 
-    def apply_chat_template(self, *args: Any, **kwargs: Any) -> Any: ...
-
     def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
+
+
+@runtime_checkable
+class ChatTemplateTokenizer(Tokenizer, Protocol):
+    """A :class:`Tokenizer` that also exposes ``apply_chat_template``.
+
+    Required only by :class:`DefaultRenderer`, the generic fallback that
+    delegates rendering to the tokenizer's Jinja chat template. The
+    hand-coded renderers reproduce each model's template in Python and only
+    touch the base :class:`Tokenizer` surface, so they don't need this.
+    """
+
+    def apply_chat_template(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
 @runtime_checkable
@@ -965,8 +983,8 @@ MODEL_RENDERER_MAP: dict[str, str] = {
     # ``enable_thinking=true`` (open ``<think>\n`` at the gen prompt);
     # the smaller 0.8B / 2B variants flip the polarity (default
     # ``enable_thinking=false``, empty ``<think>\n\n</think>\n\n``).
-    # ``Qwen35Renderer`` auto-detects polarity from the tokenizer's
-    # chat_template at construction, so all seven sizes are
+    # ``Qwen35Renderer`` hard-codes this polarity per model
+    # (``_ENABLE_THINKING_DEFAULTS``), so all seven sizes are
     # token-for-token parity-tested against their own
     # ``apply_chat_template`` — including with
     # ``add_generation_prompt=True``.

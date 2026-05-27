@@ -7,6 +7,7 @@ except ImportError:
     __version__ = "0+unknown"
 
 from renderers.base import (
+    ChatTemplateTokenizer,
     Content,
     ContentPart,
     ImagePart,
@@ -121,6 +122,7 @@ def __dir__() -> list[str]:
 __all__ = [
     "AutoRendererConfig",
     "BaseRendererConfig",
+    "ChatTemplateTokenizer",
     "Content",
     "ContentPart",
     "DeepSeekV3Renderer",
