@@ -12,9 +12,11 @@ achieve real parallelism.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
-from collections.abc import Mapping
+import os
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import replace
 from typing import Any, cast
 
@@ -33,6 +35,9 @@ from renderers.base import (
 
 _request_logger = logging.getLogger("renderers.client")
 ROUTED_EXPERTS_DATA_PREFIX = b'"routed_experts":{"data":"'
+_MM_MAX_INFLIGHT_ENV = "RENDERERS_MM_MAX_INFLIGHT"
+_DEFAULT_MM_MAX_INFLIGHT = 4
+_mm_payload_semaphores: dict[tuple[int, int], asyncio.Semaphore] = {}
 
 
 class OverlongPromptError(Exception):
@@ -122,6 +127,41 @@ async def _maybe_offload(renderer: Renderer | RendererPool, fn):
     return fn()
 
 
+def _mm_max_inflight() -> int | None:
+    raw = os.getenv(_MM_MAX_INFLIGHT_ENV)
+    if raw is None:
+        return _DEFAULT_MM_MAX_INFLIGHT
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DEFAULT_MM_MAX_INFLIGHT
+    if value < 1:
+        return None
+    return value
+
+
+@contextlib.asynccontextmanager
+async def _limit_mm_payloads(mm_data: MultiModalData | None) -> AsyncIterator[None]:
+    if mm_data is None or mm_data.is_empty():
+        yield
+        return
+
+    limit = _mm_max_inflight()
+    if limit is None:
+        yield
+        return
+
+    loop = asyncio.get_running_loop()
+    key = (id(loop), limit)
+    semaphore = _mm_payload_semaphores.get(key)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(limit)
+        _mm_payload_semaphores[key] = semaphore
+
+    async with semaphore:
+        yield
+
+
 def strip_routed_experts_data(raw: bytes) -> tuple[bytes, memoryview | None]:
     data_start = raw.find(ROUTED_EXPERTS_DATA_PREFIX)
     if data_start < 0:
@@ -157,6 +197,7 @@ async def generate(
     priority: int | None = None,
     extra_headers: dict[str, str] | None = None,
     max_prompt_len: int | None = None,
+    force_full_pixels: bool = False,
 ) -> dict[str, Any]:
     """Tokenize messages, call vLLM /inference/v1/generate, parse the response.
 
@@ -186,6 +227,15 @@ async def generate(
     cache a ``None`` cap and the pre-flight silently disables. Engine 4xx
     that still slip through propagate raw — converting them into a domain
     error is the calling client's job (its error shape is engine-specific).
+
+    ``force_full_pixels`` selects the multimodal serialization mode. When
+    ``False`` (default), images that arrive descriptor-only (no
+    ``pixel_values`` — typically prior-turn images carried through a bridge)
+    are sent hash-only on the assumption the engine still has them cached,
+    while new-turn images (which carry ``pixel_values``) are sent in full.
+    When ``True``, ``materialize_pixels`` re-attaches pixels for every image
+    and the whole prompt is sent in full — the caller's cache-miss fallback
+    after a hash-only request is rejected by the engine.
 
     Returns a dict with: request_id, prompt_ids, completion_ids,
     completion_logprobs, content, reasoning_content, tool_calls,
@@ -260,15 +310,27 @@ async def generate(
     ):
         if mm_data is None or mm_data.is_empty():
             return None, mm_data
-        # ``materialize_pixels`` lives on multimodal renderers + the pool, not
-        # the base ``Renderer`` protocol; reached only when ``mm_data`` is
-        # non-empty, which implies a multimodal renderer.
-        full_mm = cast(Any, renderer).materialize_pixels(mm_data, messages)
-        return _build_mm_features(renderer, full_mm), _strip_pixels(mm_data)
+        # First attempt (``force_full_pixels=False``): send ``mm_data`` as-is.
+        # New-turn images carry ``pixel_values`` (full payload); prior-turn
+        # images are descriptor-only and ``_build_mm_features`` serializes them
+        # hash-only, assuming the engine still has them cached.
+        # Cache-miss fallback (``force_full_pixels=True``): re-attach pixels for
+        # every image via ``materialize_pixels`` (reprocessed from the message
+        # base64) so the whole prompt is sent in full. ``materialize_pixels``
+        # lives on multimodal renderers + the pool, not the base ``Renderer``
+        # protocol; reached only when ``mm_data`` is non-empty, which implies a
+        # multimodal renderer.
+        build_mm = (
+            cast(Any, renderer).materialize_pixels(mm_data, messages)
+            if force_full_pixels
+            else mm_data
+        )
+        return _build_mm_features(renderer, build_mm), _strip_pixels(mm_data)
 
-    features, out_mm_data = await _maybe_offload(
-        renderer, _features_and_descriptor_mm
-    )
+    async with _limit_mm_payloads(mm_data):
+        features, out_mm_data = await _maybe_offload(
+            renderer, _features_and_descriptor_mm
+        )
     # ``prompt_attr.multi_modal_data`` aliases the original pixel-bearing
     # ``mm_data``; rebind it to the stripped copy so the attribution surfaced
     # to the trajectory is also descriptor-only.
@@ -439,8 +501,8 @@ def _build_qwen_vl_features(
     ``MultiModalKwargsItems``, base64-encodes each item, and assembles a
     JSON-serializable dict matching vLLM's ``MultiModalFeatures`` schema.
 
-    Returns ``None`` semantics live one level up — this helper assumes
-    the caller already verified ``mm_data`` is non-empty.
+    Returns ``None`` semantics live one level up — this helper assumes the
+    caller already verified ``mm_data`` is non-empty.
     """
     try:
         import torch
@@ -463,21 +525,29 @@ def _build_qwen_vl_features(
 
     image_items = mm_data.mm_items.get("image") or []
     if image_items:
-        # mm_items now ship numpy arrays (the renderer is torch-free);
-        # convert at this vLLM-glue boundary where torch is already a
-        # hard dependency.
-        pixel_values = torch.cat(
-            [torch.as_tensor(it["pixel_values"]) for it in image_items], dim=0
-        )
-        image_grid_thw = torch.cat(
-            [torch.as_tensor(it["image_grid_thw"]) for it in image_items], dim=0
-        )
-        hf_inputs = BatchFeature(
-            data={"pixel_values": pixel_values, "image_grid_thw": image_grid_thw}
-        )
-        config = _create_qwen2vl_field_factory(spatial_merge_size)(hf_inputs)
-        kwargs_items = MultiModalKwargsItems.from_hf_inputs(hf_inputs, config)
-        encoded = [encode_mm_kwargs_item(it) for it in kwargs_items["image"]]
+        # An item carrying ``pixel_values`` is sent as a full payload; an item
+        # without (descriptor-only) is sent hash-only, on the assumption that
+        # the engine already has it cached from an earlier turn. ``kwargs_data``
+        # stays aligned with ``mm_items``: ``None`` marks a hash-only slot.
+        # mm_items ship numpy arrays (the renderer is torch-free); convert at
+        # this vLLM-glue boundary where torch is already a hard dependency.
+        encoded: list[Any] = [None] * len(image_items)
+        full_indices = [i for i, it in enumerate(image_items) if it.get("pixel_values") is not None]
+        if full_indices:
+            full_items = [image_items[i] for i in full_indices]
+            pixel_values = torch.cat(
+                [torch.as_tensor(it["pixel_values"]) for it in full_items], dim=0
+            )
+            image_grid_thw = torch.cat(
+                [torch.as_tensor(it["image_grid_thw"]) for it in full_items], dim=0
+            )
+            hf_inputs = BatchFeature(
+                data={"pixel_values": pixel_values, "image_grid_thw": image_grid_thw}
+            )
+            config = _create_qwen2vl_field_factory(spatial_merge_size)(hf_inputs)
+            kwargs_items = MultiModalKwargsItems.from_hf_inputs(hf_inputs, config)
+            for idx, item in zip(full_indices, kwargs_items["image"]):
+                encoded[idx] = encode_mm_kwargs_item(item)
         out["kwargs_data"]["image"] = encoded
         out["mm_hashes"]["image"] = list(mm_data.mm_hashes.get("image") or [])
         out["mm_placeholders"]["image"] = [
@@ -485,10 +555,12 @@ def _build_qwen_vl_features(
             for p in mm_data.mm_placeholders.get("image") or []
         ]
 
-    # If kwargs_data is empty across all modalities, drop the key so vLLM
-    # falls back to the hash-only (cache-hit) path. Otherwise hand it the
-    # full payload.
-    if not any(out["kwargs_data"].values()):
+    # If no full payload was built across any modality, drop ``kwargs_data`` so
+    # vLLM takes the hash-only (cache-hit) path. Otherwise hand it the payload
+    # (with ``None`` slots for the hash-only images).
+    if not any(
+        any(item is not None for item in items) for items in out["kwargs_data"].values()
+    ):
         out["kwargs_data"] = None
 
     return out

@@ -148,9 +148,10 @@ class Qwen35RendererConfig(BaseRendererConfig):
     running across the entire conversation. Mirrors the chat template's
     ``add_vision_id`` toggle."""
 
-    image_cache_max: int = 256
-    """FIFO bound on the per-renderer image processor cache. Renderer-
-    internal — not a Jinja chat-template kwarg."""
+    image_cache_max: int = 0
+    """FIFO bound on the per-renderer image processor cache. Zero disables
+    caching so processed pixel buffers stay request-scoped. Renderer-internal —
+    not a Jinja chat-template kwarg."""
 
     _internal_fields = frozenset({"image_cache_max"})
 
@@ -166,7 +167,7 @@ class Qwen36RendererConfig(BaseRendererConfig):
     add_vision_id: bool = False
     """See :class:`Qwen35RendererConfig.add_vision_id`."""
 
-    image_cache_max: int = 256
+    image_cache_max: int = 0
     """See :class:`Qwen35RendererConfig.image_cache_max`."""
 
     _internal_fields = frozenset({"image_cache_max"})
@@ -180,7 +181,7 @@ class Qwen3VLRendererConfig(BaseRendererConfig):
     add_vision_id: bool = False
     """See :class:`Qwen35RendererConfig.add_vision_id`."""
 
-    image_cache_max: int = 256
+    image_cache_max: int = 0
     """See :class:`Qwen35RendererConfig.image_cache_max`."""
 
     _internal_fields = frozenset({"image_cache_max"})
@@ -294,7 +295,7 @@ class KimiK25RendererConfig(BaseRendererConfig):
     ``thinking`` (not ``enable_thinking``) to match the upstream chat
     template's native variable name."""
 
-    image_cache_max: int = 256
+    image_cache_max: int = 0
     """See :class:`Qwen35RendererConfig.image_cache_max`."""
 
     _internal_fields = frozenset({"image_cache_max"})

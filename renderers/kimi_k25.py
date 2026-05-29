@@ -677,9 +677,10 @@ class KimiK25Renderer:
         # Patch count via the processor's own calculator (matches the
         # model's per-patch attention count); kept for debugging.
         num_patches = int(img_proc.media_tokens_calculator(media_item))
-        if len(self._image_cache) >= self.config.image_cache_max:
-            self._image_cache.pop(next(iter(self._image_cache)))
-        self._image_cache[h] = (out, num_patches)
+        if self.config.image_cache_max > 0:
+            if len(self._image_cache) >= self.config.image_cache_max:
+                self._image_cache.pop(next(iter(self._image_cache)))
+            self._image_cache[h] = (out, num_patches)
         return pil, out, num_patches, h
 
     # ------------------------------------------------------------------

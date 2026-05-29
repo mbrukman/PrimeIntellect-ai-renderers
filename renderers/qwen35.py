@@ -190,9 +190,10 @@ class Qwen35Renderer:
         grid_thw = out["image_grid_thw"][0]
         merge_size = proc.image_processor.merge_size
         num_image_tokens = int(grid_thw.prod()) // (merge_size * merge_size)
-        if len(self._image_cache) >= self.config.image_cache_max:
-            self._image_cache.pop(next(iter(self._image_cache)))
-        self._image_cache[h] = (out, num_image_tokens)
+        if self.config.image_cache_max > 0:
+            if len(self._image_cache) >= self.config.image_cache_max:
+                self._image_cache.pop(next(iter(self._image_cache)))
+            self._image_cache[h] = (out, num_image_tokens)
         return pil, out, num_image_tokens, h
 
     def materialize_pixels(
